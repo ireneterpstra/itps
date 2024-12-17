@@ -31,8 +31,8 @@ from termcolor import colored
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from common.policies.policy_protocol import Policy
-from common.utils.utils import get_global_random_state, set_global_random_state
+from itps.common.policies.policy_protocol import Policy
+from itps.common.utils.utils import get_global_random_state, set_global_random_state
 
 
 def log_output_dir(out_dir):

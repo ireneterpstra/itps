@@ -4,3 +4,7 @@ itps/weights_*/
 itps/weights_*.zip
 .DS_Store
 .vscode
+data/maze2d/train/maze2d-large-sparse-v1.hdf5
+itps/train_test/*
+train_test/*
+outputs/*

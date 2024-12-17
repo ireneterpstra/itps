@@ -33,9 +33,9 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from huggingface_hub import PyTorchModelHubMixin
 from torch import Tensor, nn
 
-from common.policies.diffusion.configuration_diffusion import DiffusionConfig
-from common.policies.normalize import Normalize, Unnormalize
-from common.policies.utils import (
+from itps.common.policies.diffusion.configuration_diffusion import DiffusionConfig
+from itps.common.policies.normalize import Normalize, Unnormalize
+from itps.common.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
 )

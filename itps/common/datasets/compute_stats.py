@@ -21,7 +21,7 @@ import torch
 import tqdm
 from datasets import Image
 
-from common.datasets.video_utils import VideoFrame
+from itps.common.datasets.video_utils import VideoFrame
 
 
 def get_stats_einops_patterns(dataset, num_workers=0):

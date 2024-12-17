@@ -1,0 +1,10 @@
+# @package _global_
+
+fps: 10
+
+env:
+  name: maze2d
+  task: null
+  state_dim: 2
+  action_dim: 2
+  fps: ${fps}

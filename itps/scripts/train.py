@@ -31,24 +31,24 @@ from termcolor import colored
 from torch import nn
 from torch.cuda.amp import GradScaler
 
-from lerobot.common.datasets.factory import make_dataset, resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import MultiLeRobotDataset
-from lerobot.common.datasets.online_buffer import OnlineBuffer, compute_sampler_weights
-from lerobot.common.datasets.sampler import EpisodeAwareSampler
-from lerobot.common.datasets.utils import cycle
-from lerobot.common.envs.factory import make_env
-from lerobot.common.logger import Logger, log_output_dir
-from lerobot.common.policies.factory import make_policy
-from lerobot.common.policies.policy_protocol import PolicyWithUpdate
-from lerobot.common.policies.utils import get_device_from_parameters
-from lerobot.common.utils.utils import (
+from itps.common.datasets.factory import make_dataset, resolve_delta_timestamps
+from itps.common.datasets.lerobot_dataset import MultiLeRobotDataset
+from itps.common.datasets.online_buffer import OnlineBuffer, compute_sampler_weights
+from itps.common.datasets.sampler import EpisodeAwareSampler
+from itps.common.datasets.utils import cycle
+from itps.common.envs.factory import make_env
+from itps.common.logger import Logger, log_output_dir
+from itps.common.policies.factory import make_policy
+from itps.common.policies.policy_protocol import PolicyWithUpdate
+from itps.common.policies.utils import get_device_from_parameters
+from itps.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
     init_hydra_config,
     init_logging,
     set_global_seed,
 )
-from lerobot.scripts.eval import eval_policy
+from itps.scripts.eval import eval_policy
 
 
 def make_optimizer_and_scheduler(cfg, policy):
@@ -235,6 +235,7 @@ def log_eval_info(logger, info, step, cfg, dataset, is_online):
 
 
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
+    print(cfg.dataset_repo_id)
     if out_dir is None:
         raise NotImplementedError()
     if job_name is None:
@@ -638,6 +639,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
 @hydra.main(version_base="1.2", config_name="default", config_path="../configs")
 def train_cli(cfg: dict):
+    print(cfg.dataset_repo_id)
     train(
         cfg,
         out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,

@@ -81,6 +81,7 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
 
 
 def load_hf_dataset(repo_id, version, root, split) -> datasets.Dataset:
+    print(repo_id, version, root, split)
     """hf_dataset contains all the observations, states, actions, rewards, etc."""
     if root is not None:
         hf_dataset = load_from_disk(str(Path(root) / repo_id / "train"))
