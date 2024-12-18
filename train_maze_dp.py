@@ -7,8 +7,6 @@ examples/2_evaluate_pretrained_policy.py
 from pathlib import Path
 
 import torch
-import minari
-
 
 from itps.common.datasets.lerobot_dataset import LeRobotDataset
 from itps.common.policies.diffusion.configuration_diffusion import DiffusionConfig
@@ -35,16 +33,14 @@ delta_timestamps = {
     # used to supervise the policy.
     "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4],
 }
-# 'maze2d-large-sparse-v1.hdf5'
-# dataset = LeRobotDataset('maze2d', root='/home/clear/Documents/irene/itps/data', split=None, delta_timestamps=delta_timestamps)
-# dataset = minari.load_dataset("/home/clear/Documents/irene/itps/data/maze2d/train/maze2d-large-sparse-v1.hdf5")
-dataset = minari.load_dataset('D4RL/pointmaze/large-v2', download=True)
+dataset = LeRobotDataset('maze2d', './maze2d-large-sparse-v1.hdf5', split=None, delta_timestamps=delta_timestamps)
+
 # Set up the the policy.
 # Policies are initialized with a configuration class, in this case `DiffusionConfig`.
 # For this example, no arguments need to be passed because the defaults are set up for PushT.
 # If you're doing something different, you will likely need to change at least some of the defaults.
 cfg = DiffusionConfig()
-policy = DiffusionPolicy(cfg)
+policy = DiffusionPolicy(cfg, dataset_stats=dataset.stats)
 policy.train()
 policy.to(device)
 
@@ -65,20 +61,19 @@ step = 0
 done = False
 while not done:
     for batch in dataloader:
-        print(batch)
-        # batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        # output_dict = policy.forward(batch)
-        # loss = output_dict["loss"]
-        # loss.backward()
-        # optimizer.step()
-        # optimizer.zero_grad()
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        output_dict = policy.forward(batch)
+        loss = output_dict["loss"]
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
 
-        # if step % log_freq == 0:
-        #     print(f"step: {step} loss: {loss.item():.3f}")
-        # step += 1
-        # if step >= training_steps:
-        #     done = True
-        #     break
+        if step % log_freq == 0:
+            print(f"step: {step} loss: {loss.item():.3f}")
+        step += 1
+        if step >= training_steps:
+            done = True
+            break
 
 # Save a policy checkpoint.
 policy.save_pretrained(output_directory)

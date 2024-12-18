@@ -15,16 +15,28 @@
 # limitations under the License.
 import json
 import re
+import warnings
+from functools import cache
 from pathlib import Path
 from typing import Dict
 
 import datasets
 import torch
 from datasets import load_dataset, load_from_disk
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import DatasetCard, HfApi, hf_hub_download, snapshot_download
 from PIL import Image as PILImage
 from safetensors.torch import load_file
 from torchvision import transforms
+from itps.common.datasets.push_dataset_to_hub._diffusion_policy_replay_buffer import (
+            ReplayBuffer as DiffusionPolicyReplayBuffer,)
+
+DATASET_CARD_TEMPLATE = """
+---
+# Metadata will go there
+---
+This dataset was created using [🤗 LeRobot](https://github.com/huggingface/lerobot).
+
+"""
 
 
 def flatten_dict(d, parent_key="", sep="/"):
@@ -80,29 +92,113 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
     return items_dict
 
 
-def load_hf_dataset(repo_id, version, root, split) -> datasets.Dataset:
-    print(repo_id, version, root, split)
+@cache
+def get_hf_dataset_safe_version(repo_id: str, version: str) -> str:
+    api = HfApi()
+    dataset_info = api.list_repo_refs(repo_id, repo_type="dataset")
+    branches = [b.name for b in dataset_info.branches]
+    if version not in branches:
+        warnings.warn(
+            f"""You are trying to load a dataset from {repo_id} created with a previous version of the
+            codebase. The following versions are available: {branches}.
+            The requested version ('{version}') is not found. You should be fine since
+            backward compatibility is maintained. If you encounter a problem, contact LeRobot maintainers on
+            Discord ('https://discord.com/invite/s3KuuzsPFb') or open an issue on github.""",
+            stacklevel=1,
+        )
+        if "main" not in branches:
+            raise ValueError(f"Version 'main' not found on {repo_id}")
+        return "main"
+    else:
+        return version
+
+
+def load_hf_dataset(repo_id: str, version: str, root: Path, split: str) -> datasets.Dataset:
     """hf_dataset contains all the observations, states, actions, rewards, etc."""
     if root is not None:
-        hf_dataset = load_from_disk(str(Path(root) / repo_id / "train"))
-        # TODO(rcadene): clean this which enables getting a subset of dataset
-        if split != "train":
-            if "%" in split:
-                raise NotImplementedError(f"We dont support splitting based on percentage for now ({split}).")
-            match_from = re.search(r"train\[(\d+):\]", split)
-            match_to = re.search(r"train\[:(\d+)\]", split)
-            if match_from:
-                from_frame_index = int(match_from.group(1))
-                hf_dataset = hf_dataset.select(range(from_frame_index, len(hf_dataset)))
-            elif match_to:
-                to_frame_index = int(match_to.group(1))
-                hf_dataset = hf_dataset.select(range(to_frame_index))
-            else:
-                raise ValueError(
-                    f'`split` ({split}) should either be "train", "train[INT:]", or "train[:INT]"'
-                )
+        if 'hdf5' in root: # maze2d dataset
+            import h5py
+            import numpy as np
+            print(root)
+            with h5py.File(root, 'r') as hdf5_file:
+                # skip every 4th frame to match the original dataset
+                observations = np.array(hdf5_file['observations'])[:1000004][::4]
+                timeouts = np.array(hdf5_file['timeouts'])[:1000000][::4]
+
+            def create_episode_and_frame_indices(timeouts):
+                episode_endings = np.where(timeouts)[0]  # Indices where episodes end
+                episode_lengths = np.diff(np.concatenate(([0], episode_endings + 1)))  # Lengths of episodes
+                # Add the length of the last episode (from the last timeout to the end)
+                last_episode_length = len(timeouts) - episode_endings[-1] - 1
+                episode_lengths = np.append(episode_lengths, last_episode_length)
+                # Generate episode indices by repeating the episode number for each episode length
+                episode_index = np.repeat(np.arange(len(episode_lengths)), episode_lengths)
+                # Generate frame indices by concatenating ranges for each episode, restarting from 0
+                frame_index = np.concatenate([np.arange(length) for length in episode_lengths])
+                index = np.arange(len(timeouts))
+                return episode_index, frame_index, index
+            
+            episode_index, frame_index, index = create_episode_and_frame_indices(timeouts)
+            data_dict = {
+                'observation.state': observations[:-1, :2],
+                'observation.environment_state': observations[:-1, :2],
+                'action': observations[1:, :2],
+                'episode_index': episode_index,
+                'frame_index': frame_index,
+                'timestamp': np.copy(frame_index)/10.0,
+                'index': index
+            }
+            hf_dataset = datasets.Dataset.from_dict(data_dict)
+        elif 'zarr' in root: # diffusion policy repo data format
+            import numpy as np
+            
+            def create_episode_and_frame_indices_from_episode_ends(episode_ends):
+                episode_lengths = np.diff(np.concatenate(([0], episode_ends)))  # Lengths of episodes
+                # Generate episode indices by repeating the episode number for each episode length
+                episode_index = np.repeat(np.arange(len(episode_lengths)), episode_lengths)
+                # Generate frame indices by concatenating ranges for each episode, restarting from 0
+                frame_index = np.concatenate([np.arange(length) for length in episode_lengths])
+                index = np.arange(episode_ends[-1])
+                return episode_index, frame_index, index   
+
+            zarr_data = DiffusionPolicyReplayBuffer.copy_from_path(zarr_path=root)
+            action = zarr_data['action']
+            state = zarr_data['state']
+            episode_ends = zarr_data.meta['episode_ends']
+            episode_index, frame_index, index = create_episode_and_frame_indices_from_episode_ends(episode_ends)
+            data_dict = {
+                'observation.state': state,
+                'observation.environment_state': state,
+                'action': action,
+                'episode_index': episode_index,
+                'frame_index': frame_index,
+                'timestamp': np.copy(frame_index)/10.0,
+                'index': index
+            }
+            hf_dataset = datasets.Dataset.from_dict(data_dict)
+
+        else:
+            hf_dataset = load_from_disk(str(Path(root) / repo_id / "train"))
+            # TODO(rcadene): clean this which enables getting a subset of dataset
+            if split != "train":
+                if "%" in split:
+                    raise NotImplementedError(f"We dont support splitting based on percentage for now ({split}).")
+                match_from = re.search(r"train\[(\d+):\]", split)
+                match_to = re.search(r"train\[:(\d+)\]", split)
+                if match_from:
+                    from_frame_index = int(match_from.group(1))
+                    hf_dataset = hf_dataset.select(range(from_frame_index, len(hf_dataset)))
+                elif match_to:
+                    to_frame_index = int(match_to.group(1))
+                    hf_dataset = hf_dataset.select(range(to_frame_index))
+                else:
+                    raise ValueError(
+                        f'`split` ({split}) should either be "train", "train[INT:]", or "train[:INT]"'
+                    )   
     else:
-        hf_dataset = load_dataset(repo_id, revision=version, split=split)
+        safe_version = get_hf_dataset_safe_version(repo_id, version)
+        hf_dataset = load_dataset(repo_id, revision=safe_version, split=split)
+
     hf_dataset.set_transform(hf_transform_to_torch)
     return hf_dataset
 
@@ -120,8 +216,9 @@ def load_episode_data_index(repo_id, version, root) -> dict[str, torch.Tensor]:
     if root is not None:
         path = Path(root) / repo_id / "meta_data" / "episode_data_index.safetensors"
     else:
+        safe_version = get_hf_dataset_safe_version(repo_id, version)
         path = hf_hub_download(
-            repo_id, "meta_data/episode_data_index.safetensors", repo_type="dataset", revision=version
+            repo_id, "meta_data/episode_data_index.safetensors", repo_type="dataset", revision=safe_version
         )
 
     return load_file(path)
@@ -138,7 +235,10 @@ def load_stats(repo_id, version, root) -> dict[str, dict[str, torch.Tensor]]:
     if root is not None:
         path = Path(root) / repo_id / "meta_data" / "stats.safetensors"
     else:
-        path = hf_hub_download(repo_id, "meta_data/stats.safetensors", repo_type="dataset", revision=version)
+        safe_version = get_hf_dataset_safe_version(repo_id, version)
+        path = hf_hub_download(
+            repo_id, "meta_data/stats.safetensors", repo_type="dataset", revision=safe_version
+        )
 
     stats = load_file(path)
     return unflatten_dict(stats)
@@ -155,7 +255,8 @@ def load_info(repo_id, version, root) -> dict:
     if root is not None:
         path = Path(root) / repo_id / "meta_data" / "info.json"
     else:
-        path = hf_hub_download(repo_id, "meta_data/info.json", repo_type="dataset", revision=version)
+        safe_version = get_hf_dataset_safe_version(repo_id, version)
+        path = hf_hub_download(repo_id, "meta_data/info.json", repo_type="dataset", revision=safe_version)
 
     with open(path) as f:
         info = json.load(f)
@@ -167,7 +268,8 @@ def load_videos(repo_id, version, root) -> Path:
         path = Path(root) / repo_id / "videos"
     else:
         # TODO(rcadene): we download the whole repo here. see if we can avoid this
-        repo_dir = snapshot_download(repo_id, repo_type="dataset", revision=version)
+        safe_version = get_hf_dataset_safe_version(repo_id, version)
+        repo_dir = snapshot_download(repo_id, repo_type="dataset", revision=safe_version)
         path = Path(repo_dir) / "videos"
 
     return path
@@ -355,3 +457,29 @@ def cycle(iterable):
             yield next(iterator)
         except StopIteration:
             iterator = iter(iterable)
+
+
+def create_branch(repo_id, *, branch: str, repo_type: str | None = None):
+    """Create a branch on a existing Hugging Face repo. Delete the branch if it already
+    exists before creating it.
+    """
+    api = HfApi()
+
+    branches = api.list_repo_refs(repo_id, repo_type=repo_type).branches
+    refs = [branch.ref for branch in branches]
+    ref = f"refs/heads/{branch}"
+    if ref in refs:
+        api.delete_branch(repo_id, repo_type=repo_type, branch=branch)
+
+    api.create_branch(repo_id, repo_type=repo_type, branch=branch)
+
+
+def create_lerobot_dataset_card(tags: list | None = None, text: str | None = None) -> DatasetCard:
+    card = DatasetCard(DATASET_CARD_TEMPLATE)
+    card.data.task_categories = ["robotics"]
+    card.data.tags = ["LeRobot"]
+    if tags is not None:
+        card.data.tags += tags
+    if text is not None:
+        card.text += text
+    return card

@@ -76,6 +76,8 @@ def create_stats_buffers(
             # tensors anywhere (for example, when we use the same stats for normalization and
             # unnormalization). See the logic here
             # https://github.com/huggingface/safetensors/blob/079781fd0dc455ba0fe851e2b4507c33d0c0d407/bindings/python/py_src/safetensors/torch.py#L97.
+            # print("key", key, "mode", mode)
+            # print("stats", list(stats.keys()))
             if mode == "mean_std":
                 buffer["mean"].data = stats[key]["mean"].clone()
                 buffer["std"].data = stats[key]["std"].clone()
@@ -132,7 +134,9 @@ class Normalize(nn.Module):
     # TODO(rcadene): should we remove torch.no_grad?
     @torch.no_grad
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch = dict(batch)  # shallow copy avoids mutating the input batch
         for key, mode in self.modes.items():
+            # print(key, mode)
             buffer = getattr(self, "buffer_" + key.replace(".", "_"))
 
             if mode == "mean_std":
@@ -197,6 +201,7 @@ class Unnormalize(nn.Module):
     # TODO(rcadene): should we remove torch.no_grad?
     @torch.no_grad
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch = dict(batch)  # shallow copy avoids mutating the input batch
         for key, mode in self.modes.items():
             buffer = getattr(self, "buffer_" + key.replace(".", "_"))
 
