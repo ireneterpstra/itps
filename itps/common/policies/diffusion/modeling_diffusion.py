@@ -188,7 +188,8 @@ class DiffusionModel(nn.Module):
             self._use_env_state = True
             global_cond_dim += config.input_shapes["observation.environment_state"][0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        # self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.unet = DiffusionConditionalUnet1dEBM(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -225,6 +226,7 @@ class DiffusionModel(nn.Module):
 
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
+            #TODO: model_output, energy scalar? 
             model_output = self.unet(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
@@ -325,6 +327,8 @@ class DiffusionModel(nn.Module):
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        #TODO: is this where you find the energy? 
+        
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
@@ -565,7 +569,165 @@ class DiffusionConv1dBlock(nn.Module):
     def forward(self, x):
         return self.block(x)
 
+class EBMDiffusionGradWrapper(nn.Module):
+    def __init__(self, ebm):
+        super(DiffusionWrapper, self).__init__()
+        self.ebm = ebm
+        self.inp_dim = ebm.inp_dim
+        self.out_dim = ebm.out_dim
 
+        if hasattr(self.ebm, 'is_ebm'):
+            assert self.ebm.is_ebm, 'DiffusionWrapper only works for EBMs'
+            
+    def forward(self, inp, opt_out, t, return_energy=False, return_both=False):
+        opt_out.requires_grad_(True)
+        opt_variable = torch.cat([inp, opt_out], dim=-1)
+
+        energy = self.ebm(opt_variable, t)
+
+        if return_energy:
+            return energy
+
+        opt_grad = torch.autograd.grad([energy.sum()], [opt_out], create_graph=True)[0]
+
+        if return_both:
+            return energy, opt_grad
+        else:
+            return opt_grad
+
+class DiffusionConditionalUnet1dEBM(nn.Module):
+    """A 1D convolutional UNet with FiLM modulation for conditioning.
+
+    Note: this removes local conditioning as compared to the original diffusion policy code.
+    """
+
+    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
+        super().__init__()
+
+        self.config = config
+
+        # Encoder for the diffusion timestep.
+        self.diffusion_step_encoder = nn.Sequential(
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
+        )
+
+        # The FiLM conditioning dimension.
+        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
+
+        # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
+        # just reverse these.
+        in_out = [(config.output_shapes["action"][0], config.down_dims[0])] + list(
+            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
+        )
+
+        # Unet encoder.
+        common_res_block_kwargs = {
+            "cond_dim": cond_dim,
+            "kernel_size": config.kernel_size,
+            "n_groups": config.n_groups,
+            "use_film_scale_modulation": config.use_film_scale_modulation,
+        }
+        self.down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(
+                nn.ModuleList(
+                    [
+                        DiffusionConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
+                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Downsample as long as it is not the last block.
+                        nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        # Processing in the middle of the auto-encoder.
+        self.mid_modules = nn.ModuleList(
+            [
+                DiffusionConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+                DiffusionConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+            ]
+        )
+
+        # Unet decoder.
+        self.up_modules = nn.ModuleList([])
+        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            self.up_modules.append(
+                nn.ModuleList(
+                    [
+                        # dim_in * 2, because it takes the encoder's skip connection as well
+                        DiffusionConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
+                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Upsample as long as it is not the last block.
+                        nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        self.final_conv = nn.Sequential(
+            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            nn.Conv1d(config.down_dims[0], config.output_shapes["action"][0], 1),
+        )
+        
+        self.final_energy = nn.Linear(config.output_shapes["action"][0], 1)
+
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
+        """
+        Args:
+            x: (B, T, input_dim) tensor for input to the Unet.
+            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
+            global_cond: (B, global_cond_dim)
+            output: (B, T, input_dim)
+        Returns:
+            (B, T, input_dim) diffusion model prediction.
+        """
+        # For 1D convolutions we'll need feature dimension first.
+        x = einops.rearrange(x, "b t d -> b d t")
+
+        timesteps_embed = self.diffusion_step_encoder(timestep)
+
+        # If there is a global conditioning feature, concatenate it to the timestep embedding.
+        if global_cond is not None:
+            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
+        else:
+            global_feature = timesteps_embed
+
+        # Run encoder, keeping track of skip features to pass to the decoder.
+        encoder_skip_features: list[Tensor] = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            encoder_skip_features.append(x)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+
+        # Run decoder, using the skip features from the encoder.
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+
+        x = einops.rearrange(x, "b d t -> b t d")
+        print("x.shape", x.shape)
+        
+        # maybe turn into wrapper 
+        x = self.final_energy(x)
+        print("x.shape", x.shape)
+        return x
+    
 class DiffusionConditionalUnet1d(nn.Module):
     """A 1D convolutional UNet with FiLM modulation for conditioning.
 
@@ -690,6 +852,7 @@ class DiffusionConditionalUnet1d(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, "b d t -> b t d")
+        print("x.shape", x.shape)
         return x
 
 

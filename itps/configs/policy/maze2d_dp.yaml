@@ -2,7 +2,7 @@
 
 seed: 100000
 dataset_repo_id: maze2d
-dataset_root: '/home/rss/lerobot/data/maze2d-large-sparse-v1.hdf5'
+dataset_root: './maze2d-large-sparse-v1.hdf5'
 
 wandb:
   enable: true
@@ -10,7 +10,7 @@ hydra:
   run:
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
-    dir: /mnt/data/maze2d_dp/outputs/${now:%Y.%m.%d}/${hydra.job.name}
+    dir: ./data/maze2d_dp/outputs/${now:%Y.%m.%d}/${hydra.job.name}
   job:
     name: ${now:%H.%M.%S}_${env.name}_${policy.name}
 
