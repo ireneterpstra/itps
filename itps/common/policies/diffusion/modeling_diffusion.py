@@ -86,7 +86,8 @@ class DiffusionPolicy(
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
 
-        self.diffusion = DiffusionModel(config)
+        # self.diffusion = DiffusionModel(config)
+        self.diffusion = EBMDiffusionModel(config)
 
         self.expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         self.use_env_state = "observation.environment_state" in config.input_shapes
@@ -153,8 +154,8 @@ class DiffusionPolicy(
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
         batch = self.normalize_targets(batch)
-        loss = self.diffusion.compute_loss(batch)
-        return {"loss": loss}
+        loss, energy = self.diffusion.compute_loss(batch)
+        return {"loss": loss, "energy": energy}
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -169,6 +170,213 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
+class EBMDiffusionModel(nn.Module):
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.config = config
+
+        # Build observation encoders (depending on which observations are provided).
+        global_cond_dim = config.input_shapes["observation.state"][0]
+        num_images = len([k for k in config.input_shapes if k.startswith("observation.image")])
+        self._use_images = False
+        self._use_env_state = False
+        if num_images > 0:
+            self._use_images = True
+            self.rgb_encoder = DiffusionRgbEncoder(config)
+            global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        if "observation.environment_state" in config.input_shapes:
+            self._use_env_state = True
+            global_cond_dim += config.input_shapes["observation.environment_state"][0]
+
+        # self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.unet = DiffusionConditionalUnet1dEBM(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.ebm_unet = EBMWrapper(self.unet)
+
+        self.noise_scheduler = _make_noise_scheduler(
+            config.noise_scheduler_type,
+            num_train_timesteps=config.num_train_timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            beta_schedule=config.beta_schedule,
+            clip_sample=config.clip_sample,
+            clip_sample_range=config.clip_sample_range,
+            prediction_type=config.prediction_type,
+        )
+
+        if config.num_inference_steps is None:
+            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+        else:
+            self.num_inference_steps = config.num_inference_steps
+
+    # ========= inference  ============
+    def conditional_sample(
+        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
+    ) -> Tensor:
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+
+        # Sample prior.
+        sample = torch.randn(
+            size=(batch_size, self.config.horizon, self.config.output_shapes["action"][0]),
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+
+        for t in self.noise_scheduler.timesteps:
+            # Predict model output.
+            #TODO: model_output, energy scalar? 
+            model_energy, model_output = self.ebm_unet(
+                sample,
+                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                global_cond=global_cond, return_both=True,
+            )
+            # Compute previous image: x_t -> x_t-1
+            sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
+
+        return sample
+
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode image features and concatenate them all together along with the state vector."""
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        global_cond_feats = [batch["observation.state"]]
+        # Extract image feature (first combine batch, sequence, and camera index dims).
+        if self._use_images:
+            img_features = self.rgb_encoder(
+                einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
+            )
+            # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+            # feature dim (effectively concatenating the camera features).
+            img_features = einops.rearrange(
+                img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+            )
+            global_cond_feats.append(img_features)
+
+        if self._use_env_state:
+            global_cond_feats.append(batch["observation.environment_state"])
+
+        # Concatenate features then flatten to (B, global_cond_dim).
+        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+        }
+        """
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        # run sampling
+        actions = self.conditional_sample(batch_size, global_cond=global_cond)
+
+        # Extract `n_action_steps` steps worth of actions (from the current observation).
+        start = n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        actions = actions[:, start:end]
+
+        return actions
+
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        This function expects `batch` to have (at least):
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+
+            "action": (B, horizon, action_dim)
+            "action_is_pad": (B, horizon)
+        }
+        """
+        # Input validation.
+        assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
+        n_obs_steps = batch["observation.state"].shape[1]
+        horizon = batch["action"].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        # Forward diffusion.
+        trajectory = batch["action"]
+        # Sample noise to add to the trajectory.
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+        # Sample a random noising timestep for each item in the batch.
+        timesteps = torch.randint(
+            low=0,
+            high=self.noise_scheduler.config.num_train_timesteps,
+            size=(trajectory.shape[0],),
+            device=trajectory.device,
+        ).long()
+        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
+        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+
+        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
+        energy, pred = self.ebm_unet(noisy_trajectory, timesteps, global_cond=global_cond, return_both=True)
+        #TODO: is this where you find the energy? 
+        # print(pred.shape)
+        # print(energy.shape)
+        
+        # if self.config.supervise_energy_landscape:
+            
+            # xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+            # data_sample = self.q_sample(x_start=xmin_noise_rescale, t=t, noise=noise)
+            # # Compute energy of both distributions
+            # inp_concat = torch.cat([trajectory, trajectory], dim=0)
+            # x_concat = torch.cat([data_sample, xmin_noise], dim=0)
+            # # x_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+            # t_concat = torch.cat([timesteps, timesteps], dim=0)
+            # energy = self.model(inp_concat, x_concat, t_concat, return_energy=True)
+
+            # # Compute noise contrastive energy loss
+            # energy_real, energy_fake = torch.chunk(energy, 2, 0)
+            # energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
+            # target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
+            # loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+        
+
+        # Compute the loss.
+        # The target is either the original trajectory, or the noise.
+        if self.config.prediction_type == "epsilon":
+            target = eps
+        elif self.config.prediction_type == "sample":
+            target = batch["action"]
+        else:
+            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
+
+        loss = F.mse_loss(pred, target, reduction="none")
+
+        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
+        if self.config.do_mask_loss_for_padding:
+            if "action_is_pad" not in batch:
+                raise ValueError(
+                    "You need to provide 'action_is_pad' in the batch when "
+                    f"{self.config.do_mask_loss_for_padding=}."
+                )
+            in_episode_bound = ~batch["action_is_pad"]
+            loss = loss * in_episode_bound.unsqueeze(-1)
+            
+        # print(energy.sum())
+        # print(type(energy.sum()))
+        # print(loss.mean())
+        # print(type(loss.mean()))
+
+        return loss.mean(), energy.sum()
 
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
@@ -569,6 +777,45 @@ class DiffusionConv1dBlock(nn.Module):
     def forward(self, x):
         return self.block(x)
 
+class EBMWrapper(nn.Module):
+    def __init__(self, model):
+        super(EBMWrapper, self).__init__()
+        self.model = model
+            
+    # def forward(self, inp, opt_out, t, return_energy=False, return_both=False):
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None, return_energy=False, return_both=False) -> Tensor:
+        x.requires_grad_(True)
+        # opt_variable = torch.cat([inp, opt_out], dim=-1)
+
+        out = self.model(x, timestep, global_cond)
+        # print(out.shape)
+        # IRED Energy Calcs
+            # energy = (y - h).pow(2).sum(dim=-1).sum(dim=-1)[:, None]
+            # x = x.pow(2).sum(dim=[1, 2])[:, None]
+            # output = self.fc4(h).pow(2).sum(dim=-1)[..., None]
+            # energy = output.pow(2).sum(dim=1).sum(dim=1).sum(dim=1)[:, None]
+            # output = output.pow(2).sum(dim=[1, 2, 3])[:, None]
+            # x = self.fc_out(x).squeeze(-1)  # [B, T, N]
+            # x = x.sum(dim=[1, 2])  # [B]
+        
+        energy = out.pow(2).sum(dim=1).sum(dim=1) #[:, None]
+        # print(energy)
+        
+        if return_energy:
+            return energy
+
+        opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0] # is opt_out x? 
+
+        if return_both:
+            return energy, opt_grad
+        else:
+            return opt_grad
+        
+        
+        
+        
+        
+
 class EBMDiffusionGradWrapper(nn.Module):
     def __init__(self, ebm):
         super(DiffusionWrapper, self).__init__()
@@ -677,7 +924,7 @@ class DiffusionConditionalUnet1dEBM(nn.Module):
             nn.Conv1d(config.down_dims[0], config.output_shapes["action"][0], 1),
         )
         
-        self.final_energy = nn.Linear(config.output_shapes["action"][0], 1)
+        # self.final_energy = nn.Linear(config.output_shapes["action"][0], 1)
 
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
         """
@@ -721,11 +968,11 @@ class DiffusionConditionalUnet1dEBM(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, "b d t -> b t d")
-        print("x.shape", x.shape)
+        # print("x.shape", x.shape)
         
         # maybe turn into wrapper 
-        x = self.final_energy(x)
-        print("x.shape", x.shape)
+        # x = self.final_energy(x)
+        # print("x.shape", x.shape)
         return x
     
 class DiffusionConditionalUnet1d(nn.Module):
@@ -852,7 +1099,7 @@ class DiffusionConditionalUnet1d(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, "b d t -> b t d")
-        print("x.shape", x.shape)
+        # print("x.shape", x.shape)
         return x
 
 

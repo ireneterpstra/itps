@@ -122,6 +122,8 @@ def update_policy(
         output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
         loss = output_dict["loss"]
+        energy = output_dict["energy"]
+        
     grad_scaler.scale(loss).backward()
 
     # Unscale the graident of the optimzer's assigned params in-place **prior to gradient clipping**.
@@ -151,22 +153,29 @@ def update_policy(
 
     info = {
         "loss": loss.item(),
+        "energy": energy.item(),
         "grad_norm": float(grad_norm),
         "lr": optimizer.param_groups[0]["lr"],
         "update_s": time.perf_counter() - start_time,
-        **{k: v for k, v in output_dict.items() if k != "loss"},
+        **{k: v for k, v in output_dict.items() if (k != "loss" and k != "energy") },
     }
+    # print(info)
     info.update({k: v for k, v in output_dict.items() if k not in info})
+    # print(info)
 
     return info
 
 
 def log_train_info(logger: Logger, info, step, cfg, dataset, is_online):
     loss = info["loss"]
+    energy = info["energy"]
     grad_norm = info["grad_norm"]
     lr = info["lr"]
     update_s = info["update_s"]
     dataloading_s = info["dataloading_s"]
+    
+    # print(type(loss))
+    # print(type(energy))
 
     # A sample is an (observation,action) pair, where observation and action
     # can be on multiple timestamps. In a batch, we have `batch_size`` number of samples.
@@ -183,6 +192,7 @@ def log_train_info(logger: Logger, info, step, cfg, dataset, is_online):
         # number of time all unique samples are seen
         f"epch:{num_epochs:.2f}",
         f"loss:{loss:.3f}",
+        f"energy:{energy:.3f}",
         f"grdn:{grad_norm:.3f}",
         f"lr:{lr:0.1e}",
         # in seconds
