@@ -42,6 +42,11 @@ from itps.common.policies.utils import (
     populate_queues,
 )
 
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
 
 class DiffusionPolicy(
     nn.Module,
@@ -154,8 +159,8 @@ class DiffusionPolicy(
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
         batch = self.normalize_targets(batch)
-        loss, energy = self.diffusion.compute_loss(batch)
-        return {"loss": loss, "energy": energy}
+        loss, (loss_denoise, loss_energy, loss_opt) = self.diffusion.compute_loss(batch)
+        return {"loss": loss, "sub_loss": (loss_denoise, loss_energy, loss_opt)}
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -190,7 +195,7 @@ class EBMDiffusionModel(nn.Module):
 
         # self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
         self.unet = DiffusionConditionalUnet1dEBM(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
-        self.ebm_unet = EBMWrapper(self.unet)
+        self.model = EBMWrapper(self.unet)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -202,7 +207,30 @@ class EBMDiffusionModel(nn.Module):
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
         )
+        
+        # self.device = get_device_from_parameters(self)
+        # print("device", self.device)
+        
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod
+        
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+        
+        register_buffer('opt_step_size', self.noise_scheduler.betas * torch.sqrt( 1 / (1 - alphas_cumprod)))
+    
+        # self.opt_step_size = (self.noise_scheduler.betas * torch.sqrt( 1 / (1 - self.noise_scheduler.alphas_cumprod))).to(torch.float32)
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+
+        if self.config.prediction_type == "epsilon":
+            loss_weight = torch.ones_like(snr)
+        elif self.config.prediction_type == "sample":
+            loss_weight = snr
+            
+        register_buffer('loss_weight', loss_weight)
+        
         if config.num_inference_steps is None:
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
@@ -228,7 +256,7 @@ class EBMDiffusionModel(nn.Module):
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
             #TODO: model_output, energy scalar? 
-            model_energy, model_output = self.ebm_unet(
+            model_energy, model_output = self.model(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                 global_cond=global_cond, return_both=True,
@@ -286,6 +314,45 @@ class EBMDiffusionModel(nn.Module):
         actions = actions[:, start:end]
 
         return actions
+    
+    def opt_step(self, traj, t, global_cond=None, step=5, eval=True, sf=1.0, detach=True):
+        with torch.enable_grad():
+            for i in range(step):
+
+                energy, grad = self.model(traj, t, global_cond=global_cond, return_both=True)
+                traj_new = traj - extract(self.opt_step_size.to(traj.device), t, grad.shape) * grad * sf  # / (i + 1) ** 0.5
+
+                # if self.continuous:
+                #     sf = 2.0
+                # else:
+                sf = 1.0
+
+                max_val = extract(self.sqrt_alphas_cumprod.to(traj.device), t, traj_new.shape)[0, 0] * sf
+                traj_new = torch.clamp(traj_new, -max_val, max_val)
+
+                energy_new = self.model(traj_new, t, global_cond=global_cond, return_energy=True)
+                if len(energy_new.shape) == 2:
+                    bad_step = (energy_new > energy)[:, 0]
+                elif len(energy_new.shape) == 1:
+                    bad_step = (energy_new > energy)
+                else:
+                    raise ValueError('Bad shape!!!')
+
+                # print("step: ", i, bad_step.float().mean())
+                traj_new[bad_step] = traj[bad_step]
+
+                if eval:
+                    traj = traj_new.detach()
+                else:
+                    traj = traj_new
+
+        return traj
+    
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
@@ -310,10 +377,11 @@ class EBMDiffusionModel(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim) # corresponds to inp in IRED
 
         # Forward diffusion.
         trajectory = batch["action"]
+        # print("trajectory", trajectory.shape)
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
         # Sample a random noising timestep for each item in the batch.
@@ -327,29 +395,8 @@ class EBMDiffusionModel(nn.Module):
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        energy, pred = self.ebm_unet(noisy_trajectory, timesteps, global_cond=global_cond, return_both=True)
-        #TODO: is this where you find the energy? 
-        # print(pred.shape)
-        # print(energy.shape)
+        pred = self.model(noisy_trajectory, timesteps, global_cond=global_cond)
         
-        # if self.config.supervise_energy_landscape:
-            
-            # xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
-            # data_sample = self.q_sample(x_start=xmin_noise_rescale, t=t, noise=noise)
-            # # Compute energy of both distributions
-            # inp_concat = torch.cat([trajectory, trajectory], dim=0)
-            # x_concat = torch.cat([data_sample, xmin_noise], dim=0)
-            # # x_concat = torch.cat([xmin, xmin_noise_min], dim=0)
-            # t_concat = torch.cat([timesteps, timesteps], dim=0)
-            # energy = self.model(inp_concat, x_concat, t_concat, return_energy=True)
-
-            # # Compute noise contrastive energy loss
-            # energy_real, energy_fake = torch.chunk(energy, 2, 0)
-            # energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
-            # target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
-            # loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
-        
-
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
         if self.config.prediction_type == "epsilon":
@@ -360,7 +407,9 @@ class EBMDiffusionModel(nn.Module):
             raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
 
         loss = F.mse_loss(pred, target, reduction="none")
-
+        
+        
+        
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
             if "action_is_pad" not in batch:
@@ -371,12 +420,69 @@ class EBMDiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
             
+        loss = einops.reduce(loss, 'b ... -> b (...)', 'mean')
+        
+        loss = loss * extract(self.loss_weight, timesteps, loss.shape)
+        loss_mse = loss
+        
+        # print("loss_mse pre", loss_mse.shape)
+        
+        # Shape the Energy Landscape Contrastively
+        if self.config.supervise_energy_landscape:
+            # resample noisy trajectory
+            eps = torch.randn(trajectory.shape, device=trajectory.device)
+            data_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps) # self.q_sample(x_start = x_start, t = t, noise = noise)
+            
+            # Curruption Function: construct a set of negative labels
+            xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+            
+            xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0)
+            xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
+            loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+            
+            xmin_noise = xmin_noise.detach()
+            xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
+            xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
+            
+            loss_scale = 0.5
+            
+            xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
+            
+            
+            # Compute energy of both distributions
+            global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+            traj_concat = torch.cat([data_sample, xmin_noise], dim=0)
+            # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+            t_concat = torch.cat([timesteps, timesteps], dim=0)
+            energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+
+
+            # Compute noise contrastive energy loss
+            energy_real, energy_fake = torch.chunk(energy, 2, 0)
+            # why is this cat?????
+            energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
+            # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
+            target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
+            
+            loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+
+            # print("loss_mse", loss_mse.shape)
+            # print("loss_energy", loss_energy.shape)
+            
+            loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
+
+            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_opt.mean())
+        else:
+            loss = loss_mse
+            return loss.mean(), (loss_mse.mean(), -1, -1)
+        
+            
         # print(energy.sum())
         # print(type(energy.sum()))
         # print(loss.mean())
         # print(type(loss.mean()))
 
-        return loss.mean(), energy.sum()
+        # return loss.mean(), energy.sum()
 
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
@@ -798,7 +904,7 @@ class EBMWrapper(nn.Module):
             # x = self.fc_out(x).squeeze(-1)  # [B, T, N]
             # x = x.sum(dim=[1, 2])  # [B]
         
-        energy = out.pow(2).sum(dim=1).sum(dim=1) #[:, None]
+        energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
         # print(energy)
         
         if return_energy:

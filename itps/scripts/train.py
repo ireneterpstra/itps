@@ -122,7 +122,7 @@ def update_policy(
         output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
         loss = output_dict["loss"]
-        energy = output_dict["energy"]
+        loss_denoise, loss_energy, loss_opt = output_dict["sub_loss"]
         
     grad_scaler.scale(loss).backward()
 
@@ -153,11 +153,13 @@ def update_policy(
 
     info = {
         "loss": loss.item(),
-        "energy": energy.item(),
+        "loss_denoise": loss_denoise.item(), 
+        "loss_energy": loss_energy.item(), 
+        "loss_opt": loss_opt.item(),
         "grad_norm": float(grad_norm),
         "lr": optimizer.param_groups[0]["lr"],
         "update_s": time.perf_counter() - start_time,
-        **{k: v for k, v in output_dict.items() if (k != "loss" and k != "energy") },
+        **{k: v for k, v in output_dict.items() if (k != "loss" and k != "sub_loss") },
     }
     # print(info)
     info.update({k: v for k, v in output_dict.items() if k not in info})
@@ -168,7 +170,9 @@ def update_policy(
 
 def log_train_info(logger: Logger, info, step, cfg, dataset, is_online):
     loss = info["loss"]
-    energy = info["energy"]
+    loss_denoise = info["loss_denoise"]
+    loss_energy = info["loss_energy"]
+    loss_opt = info["loss_opt"]
     grad_norm = info["grad_norm"]
     lr = info["lr"]
     update_s = info["update_s"]
@@ -192,7 +196,9 @@ def log_train_info(logger: Logger, info, step, cfg, dataset, is_online):
         # number of time all unique samples are seen
         f"epch:{num_epochs:.2f}",
         f"loss:{loss:.3f}",
-        f"energy:{energy:.3f}",
+        f"loss_denoise:{loss_denoise:.3f}",
+        f"loss_energy:{loss_energy:.3f}",
+        f"loss_opt:{loss_opt:.3f}",
         f"grdn:{grad_norm:.3f}",
         f"lr:{lr:0.1e}",
         # in seconds
