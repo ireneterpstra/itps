@@ -162,7 +162,7 @@ def update_policy(
         **{k: v for k, v in output_dict.items() if (k != "loss" and k != "sub_loss") },
     }
     # print(info)
-    info.update({k: v for k, v in output_dict.items() if k not in info})
+    info.update({k: v for k, v in output_dict.items() if k not in info and k != "sub_loss"})
     # print(info)
 
     return info
