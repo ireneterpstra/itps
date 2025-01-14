@@ -493,9 +493,7 @@ if __name__ == "__main__":
     if args.policy in ["diffusion", "dp"]:
         checkpoint_path = 'weights_dp' # weights_dp
     elif args.policy in ["act"]:
-        checkpoint_path = 'weights_act'#'weights_act'
-    # elif args.policy in ["act_test"]:
-    #     checkpoint_path = 'weights_maze2d_act_5000'
+        checkpoint_path = 'weights_act'
     else:
         raise NotImplementedError(f"Policy with name {args.policy} is not implemented.")
 
