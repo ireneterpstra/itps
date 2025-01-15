@@ -491,7 +491,7 @@ if __name__ == "__main__":
         alignment_strategy = 'stochastic-sampling'
 
     if args.policy in ["diffusion", "dp"]:
-        checkpoint_path = 'weights_dp' # weights_dp
+        checkpoint_path = 'weights_maze2d_energy_dp_100k' # weights_dp
     elif args.policy in ["act"]:
         checkpoint_path = 'weights_act'
     else:

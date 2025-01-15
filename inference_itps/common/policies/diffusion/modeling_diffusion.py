@@ -33,6 +33,8 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from huggingface_hub import PyTorchModelHubMixin
 from torch import Tensor, nn
 
+from torchinfo import summary
+
 from common.policies.diffusion.configuration_diffusion import DiffusionConfig
 from common.policies.normalize import Normalize, Unnormalize
 from common.policies.utils import (
@@ -40,6 +42,11 @@ from common.policies.utils import (
     get_dtype_from_parameters,
 )
 import time
+
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
     """
@@ -79,7 +86,8 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
 
-        self.diffusion = DiffusionModel(config, alginment_strategy=alignment_strategy)
+        # self.diffusion = DiffusionModel(config, alginment_strategy=alignment_strategy)
+        self.diffusion = EBMDiffusionModel(config, alginment_strategy=alignment_strategy)
 
         self.expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         self.use_env_state = "observation.environment_state" in config.input_shapes
@@ -128,7 +136,7 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
-class DiffusionModel(nn.Module):
+class EBMDiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig, alginment_strategy: str):
         super().__init__()
         self.config = config
@@ -146,8 +154,9 @@ class DiffusionModel(nn.Module):
             self._use_env_state = True
             global_cond_dim += config.input_shapes["observation.environment_state"][0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
-
+        self.unet = DiffusionConditionalUnet1dEBM(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.model = EBMWrapper(self.unet)
+        
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
             num_train_timesteps=config.num_train_timesteps,
@@ -158,6 +167,26 @@ class DiffusionModel(nn.Module):
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
         )
+        
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod
+        
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+        
+        register_buffer('opt_step_size', self.noise_scheduler.betas * torch.sqrt( 1 / (1 - alphas_cumprod)))
+    
+        # self.opt_step_size = (self.noise_scheduler.betas * torch.sqrt( 1 / (1 - self.noise_scheduler.alphas_cumprod))).to(torch.float32)
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+        
+        if self.config.prediction_type == "epsilon":
+            loss_weight = torch.ones_like(snr)
+        elif self.config.prediction_type == "sample":
+            loss_weight = snr
+        
+        register_buffer('loss_weight', loss_weight)
 
         if config.num_inference_steps is None:
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
@@ -215,7 +244,7 @@ class DiffusionModel(nn.Module):
                 continue
             for i in range(MCMC_steps):
                 # Predict model output.
-                model_output = self.unet(
+                model_output = self.model(
                     sample,
                     torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                     global_cond=global_cond,
@@ -318,6 +347,45 @@ class DiffusionModel(nn.Module):
         actions = actions[:, start:end]
 
         return actions
+    
+    def opt_step(self, traj, t, global_cond=None, step=5, eval=True, sf=1.0, detach=True):
+        with torch.enable_grad():
+            for i in range(step):
+
+                energy, grad = self.model(traj, t, global_cond=global_cond, return_both=True)
+                traj_new = traj - extract(self.opt_step_size.to(traj.device), t, grad.shape) * grad * sf  # / (i + 1) ** 0.5
+
+                # if self.continuous:
+                #     sf = 2.0
+                # else:
+                sf = 1.0
+
+                max_val = extract(self.sqrt_alphas_cumprod.to(traj.device), t, traj_new.shape)[0, 0] * sf
+                traj_new = torch.clamp(traj_new, -max_val, max_val)
+
+                energy_new = self.model(traj_new, t, global_cond=global_cond, return_energy=True)
+                if len(energy_new.shape) == 2:
+                    bad_step = (energy_new > energy)[:, 0]
+                elif len(energy_new.shape) == 1:
+                    bad_step = (energy_new > energy)
+                else:
+                    raise ValueError('Bad shape!!!')
+
+                # print("step: ", i, bad_step.float().mean())
+                traj_new[bad_step] = traj[bad_step]
+
+                if eval:
+                    traj = traj_new.detach()
+                else:
+                    traj = traj_new
+
+        return traj
+    
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
@@ -359,7 +427,7 @@ class DiffusionModel(nn.Module):
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        pred = self.model(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
@@ -381,9 +449,86 @@ class DiffusionModel(nn.Module):
                 )
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
+    
+        loss = einops.reduce(loss, 'b ... -> b (...)', 'mean')
+        
+        loss = loss * extract(self.loss_weight, timesteps, loss.shape)
+        loss_mse = loss
+            
+        # Shape the Energy Landscape Contrastively
+        if self.config.supervise_energy_landscape:
+            # resample noisy trajectory
+            eps = torch.randn(trajectory.shape, device=trajectory.device)
+            data_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps) # self.q_sample(x_start = x_start, t = t, noise = noise)
+            
+            # Curruption Function: construct a set of negative labels
+            xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+            
+            xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0)
+            xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
+            loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+            
+            xmin_noise = xmin_noise.detach()
+            xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
+            xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
+            
+            loss_scale = 0.5
+            
+            xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
+            
+            
+            # Compute energy of both distributions
+            global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+            traj_concat = torch.cat([data_sample, xmin_noise], dim=0)
+            # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+            t_concat = torch.cat([timesteps, timesteps], dim=0)
+            energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
 
-        return loss.mean()
 
+            # Compute noise contrastive energy loss
+            energy_real, energy_fake = torch.chunk(energy, 2, 0)
+            # why is this cat?????
+            energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
+            # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
+            target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
+            
+            loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+            
+            loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
+
+            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_opt.mean())
+        else:
+            loss = loss_mse
+            return loss.mean(), (loss_mse.mean(), torch.tensor(-1), torch.tensor(-1))
+
+class EBMWrapper(nn.Module):
+    def __init__(self, model):
+        super(EBMWrapper, self).__init__()
+        self.model = model
+            
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None, return_energy=False, return_both=False) -> Tensor:
+        x.requires_grad_(True)
+
+        out = self.model(x, timestep, global_cond)
+        summary(self.model)
+        
+        energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
+        # print(energy)
+        
+        if return_energy:
+            return energy
+
+        # energy.requires_grad_(True)
+        # opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0] # is opt_out x? 
+        with torch.enable_grad():
+            energy.requires_grad_(True)
+            x.requires_grad_(True)
+            opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=False)[0] # is opt_out x? 
+
+        if return_both:
+            return energy, opt_grad
+        else:
+            return opt_grad
 
 class SpatialSoftmax(nn.Module):
     """
@@ -599,6 +744,140 @@ class DiffusionConv1dBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
+    
+
+class DiffusionConditionalUnet1dEBM(nn.Module):
+    """A 1D convolutional UNet with FiLM modulation for conditioning.
+
+    Note: this removes local conditioning as compared to the original diffusion policy code.
+    """
+
+    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
+        super().__init__()
+
+        self.config = config
+
+        # Encoder for the diffusion timestep.
+        self.diffusion_step_encoder = nn.Sequential(
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
+        )
+
+        # The FiLM conditioning dimension.
+        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
+
+        # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
+        # just reverse these.
+        in_out = [(config.output_shapes["action"][0], config.down_dims[0])] + list(
+            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
+        )
+
+        # Unet encoder.
+        common_res_block_kwargs = {
+            "cond_dim": cond_dim,
+            "kernel_size": config.kernel_size,
+            "n_groups": config.n_groups,
+            "use_film_scale_modulation": config.use_film_scale_modulation,
+        }
+        self.down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(
+                nn.ModuleList(
+                    [
+                        DiffusionConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
+                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Downsample as long as it is not the last block.
+                        nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        # Processing in the middle of the auto-encoder.
+        self.mid_modules = nn.ModuleList(
+            [
+                DiffusionConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+                DiffusionConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+            ]
+        )
+
+        # Unet decoder.
+        self.up_modules = nn.ModuleList([])
+        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            self.up_modules.append(
+                nn.ModuleList(
+                    [
+                        # dim_in * 2, because it takes the encoder's skip connection as well
+                        DiffusionConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
+                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Upsample as long as it is not the last block.
+                        nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        self.final_conv = nn.Sequential(
+            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            nn.Conv1d(config.down_dims[0], config.output_shapes["action"][0], 1),
+        )
+        
+        # self.final_energy = nn.Linear(config.output_shapes["action"][0], 1)
+
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
+        """
+        Args:
+            x: (B, T, input_dim) tensor for input to the Unet.
+            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
+            global_cond: (B, global_cond_dim)
+            output: (B, T, input_dim)
+        Returns:
+            (B, T, input_dim) diffusion model prediction.
+        """
+        # For 1D convolutions we'll need feature dimension first.
+        x = einops.rearrange(x, "b t d -> b d t")
+
+        timesteps_embed = self.diffusion_step_encoder(timestep)
+
+        # If there is a global conditioning feature, concatenate it to the timestep embedding.
+        if global_cond is not None:
+            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
+        else:
+            global_feature = timesteps_embed
+
+        # Run encoder, keeping track of skip features to pass to the decoder.
+        encoder_skip_features: list[Tensor] = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            encoder_skip_features.append(x)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+
+        # Run decoder, using the skip features from the encoder.
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+
+        x = einops.rearrange(x, "b d t -> b t d")
+        # print("x.shape", x.shape)
+        
+        # maybe turn into wrapper 
+        # x = self.final_energy(x)
+        # print("x.shape", x.shape)
+        return x  
 
 
 class DiffusionConditionalUnet1d(nn.Module):

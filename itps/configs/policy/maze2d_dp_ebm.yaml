@@ -100,4 +100,4 @@ policy:
   do_mask_loss_for_padding: false
 
 
-  supervise_energy_landscape: True
+  supervise_energy_landscape: False
