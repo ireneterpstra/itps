@@ -508,22 +508,23 @@ class EBMWrapper(nn.Module):
             
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None, return_energy=False, return_both=False) -> Tensor:
         x.requires_grad_(True)
-
-        out = self.model(x, timestep, global_cond)
-        summary(self.model)
         
-        energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
+        with torch.enable_grad():
+            out = self.model(x, timestep, global_cond)
+        # summary(self.model)
+        
+            energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
         # print(energy)
         
-        if return_energy:
-            return energy
+            if return_energy:
+                return energy
 
-        # energy.requires_grad_(True)
-        # opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0] # is opt_out x? 
-        with torch.enable_grad():
-            energy.requires_grad_(True)
-            x.requires_grad_(True)
-            opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=False)[0] # is opt_out x? 
+            # energy.requires_grad_(True)
+            opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0] # is opt_out x? 
+        # with torch.enable_grad():
+        #     energy.requires_grad_(True)
+        #     x.requires_grad_(True)
+        #     opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=False)[0] # is opt_out x? 
 
         if return_both:
             return energy, opt_grad
