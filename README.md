@@ -5,7 +5,7 @@ Maze2D benchmark of various sampling methods with sketch input from the paper [I
 ## Installation 
 Clone this repo
 ```
-git clone git@github.com:yanweiw/itps.git
+git clone git@github.com:ireneterpstra/itps.git
 cd itps
 ```
 Create a virtual environment with Python 3.10
@@ -17,7 +17,7 @@ Install ITPS
 ```
 pip install -e .
 ```
-Download the pre-trained weights for [Action Chunking Transformers](https://drive.google.com/file/d/1kKt__yQpXOzgAGFvfGpBWdtWX_QxWsVK/view?usp=sharing) and [Diffusion Policy](https://drive.google.com/file/d/1efez47zfkXl7HgGDSzW-tagdcPj1p8z2/view?usp=sharing) and put them in the `itps/itps` folder. 
+Download the pre-trained weights for [Diffusion Policy with Energy Model](https://drive.google.com/drive/folders/1ScUwhFV0nZn-Zkyp_v9D3MFEo-X8l1-e?usp=sharing), [Action Chunking Transformers](https://drive.google.com/file/d/1kKt__yQpXOzgAGFvfGpBWdtWX_QxWsVK/view?usp=sharing) and [Diffusion Policy](https://drive.google.com/file/d/1efez47zfkXl7HgGDSzW-tagdcPj1p8z2/view?usp=sharing) and put them in the `itps/inference_itps` folder. 
 
 ## Visualize pre-trained policies. 
 
