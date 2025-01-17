@@ -19,7 +19,16 @@ pip install -e .
 ```
 Download the pre-trained weights for [Diffusion Policy with Energy Model](https://drive.google.com/drive/folders/1ScUwhFV0nZn-Zkyp_v9D3MFEo-X8l1-e?usp=sharing), [Action Chunking Transformers](https://drive.google.com/file/d/1kKt__yQpXOzgAGFvfGpBWdtWX_QxWsVK/view?usp=sharing) and [Diffusion Policy](https://drive.google.com/file/d/1efez47zfkXl7HgGDSzW-tagdcPj1p8z2/view?usp=sharing) and put them in the `itps/inference_itps` folder. 
 
+## Train your own policies. 
+
+#### From the repo folder: 
+```
+python itps/scripts/train.py policy=maze2d_dp env=maze2d
+```
+This will save your weights to `data/maze2d_dp/outputs/(date)/`
+
 ## Visualize pre-trained policies. 
+#### From the `inference_itps` folder: 
 
 Run ACT or DP or DP with EBM unconditionally to explore motion manifolds learned by these pre-trained policies.
 ```
