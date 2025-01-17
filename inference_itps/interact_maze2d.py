@@ -221,7 +221,7 @@ class UnconditionalMaze(MazeEnv):
     def infer_target(self, guide=None, visualizer=None):
         agent_hist_xy = self.agent_history_xy[-1] 
         agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
-        if self.policy_tag == 'dp':
+        if self.policy_tag[:2] == 'dp':
             agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
 
         obs_batch = {
@@ -491,7 +491,9 @@ if __name__ == "__main__":
         alignment_strategy = 'stochastic-sampling'
 
     if args.policy in ["diffusion", "dp"]:
-        checkpoint_path = 'weights_maze2d_energy_dp_100k' # weights_dp
+        checkpoint_path = 'weights_dp'
+    elif args.policy in ["dp_ebm"]:
+        checkpoint_path = 'weights_maze2d_energy_dp_100k'
     elif args.policy in ["act"]:
         checkpoint_path = 'weights_act'
     else:
@@ -507,6 +509,14 @@ if __name__ == "__main__":
         policy.diffusion.num_inference_steps = 10
         policy.config.n_action_steps = policy.config.horizon - policy.config.n_obs_steps + 1
         policy_tag = 'dp'
+        policy.cuda()
+        policy.eval()
+    elif args.policy in ["dp_ebm"]:
+        policy = DiffusionPolicy.from_pretrained(pretrained_policy_path, alignment_strategy=alignment_strategy)
+        policy.config.noise_scheduler_type = "DDIM"
+        policy.diffusion.num_inference_steps = 10
+        policy.config.n_action_steps = policy.config.horizon - policy.config.n_obs_steps + 1
+        policy_tag = 'dp_ebm'
         policy.cuda()
         policy.eval()
     elif args.policy in ["act"]:
