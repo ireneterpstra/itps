@@ -21,9 +21,9 @@ Download the pre-trained weights for [Diffusion Policy with Energy Model](https:
 
 ## Visualize pre-trained policies. 
 
-Run ACT or DP unconditionally to explore motion manifolds learned by these pre-trained policies.
+Run ACT or DP or DP with EBM unconditionally to explore motion manifolds learned by these pre-trained policies.
 ```
-python interact_maze2d.py -p [act, dp] -u
+python interact_maze2d.py -p [act, dp, dp_ebm] -u
 ```
 |Multimodal predictions of DP|
 |---------------------------|
@@ -38,7 +38,7 @@ python interact_maze2d.py -p [act, dp] -u
 `-gd` - Guided Diffusion
 `-ss` - Stochastic Sampling
 ```
-python interact_maze2d.py -p [act, dp] [-ph, -bi, -gd, -ss]
+python interact_maze2d.py -p [act, dp, dp_ebm] [-ph, -bi, -gd, -ss]
 ```
 |Post-Hoc Ranking Example|
 |---------------------------|
@@ -49,7 +49,7 @@ Draw by clicking and dragging the mouse. Re-initialize the agent (red) position 
 
 Run DP with BI, GD or SS with `-v` option.
 ```
-python interact_maze2d.py -p [act, dp] [-bi, -gd, -ss] -v
+python interact_maze2d.py -p [act, dp, dp_ebm] [-bi, -gd, -ss] -v
 ```
 | Stochastic Sampling Example|
 |---------------------------|
@@ -58,15 +58,15 @@ python interact_maze2d.py -p [act, dp] [-bi, -gd, -ss] -v
 ## Benchmark methods.
 Save sketches into a file `exp00.json` and use them across methods.
 ```
-python interact_maze2d.py -p [act, dp] -s exp00.json
+python interact_maze2d.py -p [act, dp, dp_ebm] -s exp00.json
 ```
 Visualize saved sketches by loading the saved file, press the key `n` for next. 
 ```
-python interact_maze2d.py -p [act, dp] [-ph, -op, -bi, -gd, -ss] -l exp00.json
+python interact_maze2d.py -p [act, dp, dp_ebm] [-ph, -op, -bi, -gd, -ss] -l exp00.json
 ```
 Save experiments into `exp00_dp_gd.json`
 ```
-python interact_maze2d.py -p dp -gd -l exp00.json -s .json
+python interact_maze2d.py -p [act, dp, dp_ebm] -gd -l exp00.json -s .json
 ```
 Replay experiments.
 ```
