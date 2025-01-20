@@ -15,9 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
-
-TODO(alexander-soare):
-  - Remove reliance on diffusers for DDPMScheduler and LR scheduler.
 """
 
 import math
@@ -50,13 +47,7 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
-class DiffusionPolicy(
-    nn.Module,
-    PyTorchModelHubMixin,
-    library_name="lerobot",
-    repo_url="https://github.com/huggingface/lerobot",
-    tags=["robotics", "diffusion-policy"],
-):
+class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
     (paper: https://arxiv.org/abs/2303.04137, code: https://github.com/real-stanford/diffusion_policy).
@@ -195,10 +186,8 @@ class EBMDiffusionModel(nn.Module):
             self._use_env_state = True
             global_cond_dim += config.input_shapes["observation.environment_state"][0]
 
-        # self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
-        self.unet = DiffusionConditionalUnet1dEBM(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
         self.model = EBMWrapper(self.unet)
-        print(self.model)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -210,9 +199,6 @@ class EBMDiffusionModel(nn.Module):
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
         )
-        
-        # self.device = get_device_from_parameters(self)
-        # print("device", self.device)
         
         alphas_cumprod = self.noise_scheduler.alphas_cumprod
         
@@ -341,7 +327,6 @@ class EBMDiffusionModel(nn.Module):
                 else:
                     raise ValueError('Bad shape!!!')
 
-                # print("step: ", i, bad_step.float().mean())
                 traj_new[bad_step] = traj[bad_step]
 
                 if eval:
@@ -384,7 +369,7 @@ class EBMDiffusionModel(nn.Module):
 
         # Forward diffusion.
         trajectory = batch["action"]
-        # print("trajectory", trajectory.shape)
+        
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
         # Sample a random noising timestep for each item in the batch.
@@ -439,6 +424,7 @@ class EBMDiffusionModel(nn.Module):
             # Curruption Function: construct a set of negative labels
             xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
+            ##### how neccesary is this?? retrain w/o this
             xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0)
             xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
             loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
@@ -447,10 +433,10 @@ class EBMDiffusionModel(nn.Module):
             xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
             xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
             
-            loss_scale = 0.5
-            
             xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
+            ##### how neccesary is this? retrain w/o this
             
+            loss_scale = 0.5
             
             # Compute energy of both distributions
             global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
@@ -462,7 +448,6 @@ class EBMDiffusionModel(nn.Module):
 
             # Compute noise contrastive energy loss
             energy_real, energy_fake = torch.chunk(energy, 2, 0)
-            # why is this cat?????
             energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
             # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
             target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
@@ -475,197 +460,38 @@ class EBMDiffusionModel(nn.Module):
         else:
             loss = loss_mse
             return loss.mean(), (loss_mse.mean(), torch.tensor(-1), torch.tensor(-1))
-        
+
+
+class EBMWrapper(nn.Module):
+    def __init__(self, model):
+        super(EBMWrapper, self).__init__()
+        self.model = model
             
-        # print(energy.sum())
-        # print(type(energy.sum()))
-        # print(loss.mean())
-        # print(type(loss.mean()))
+    # def forward(self, inp, opt_out, t, return_energy=False, return_both=False):
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None, return_energy=False, return_both=False) -> Tensor:
+        x.requires_grad_(True)
 
-        # return loss.mean(), energy.sum()
-
-class DiffusionModel(nn.Module):
-    def __init__(self, config: DiffusionConfig):
-        super().__init__()
-        self.config = config
-
-        # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = config.input_shapes["observation.state"][0]
-        num_images = len([k for k in config.input_shapes if k.startswith("observation.image")])
-        self._use_images = False
-        self._use_env_state = False
-        if num_images > 0:
-            self._use_images = True
-            self.rgb_encoder = DiffusionRgbEncoder(config)
-            global_cond_dim += self.rgb_encoder.feature_dim * num_images
-        if "observation.environment_state" in config.input_shapes:
-            self._use_env_state = True
-            global_cond_dim += config.input_shapes["observation.environment_state"][0]
-
-        # self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
-        self.unet = DiffusionConditionalUnet1dEBM(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
-
-        self.noise_scheduler = _make_noise_scheduler(
-            config.noise_scheduler_type,
-            num_train_timesteps=config.num_train_timesteps,
-            beta_start=config.beta_start,
-            beta_end=config.beta_end,
-            beta_schedule=config.beta_schedule,
-            clip_sample=config.clip_sample,
-            clip_sample_range=config.clip_sample_range,
-            prediction_type=config.prediction_type,
-        )
-
-        if config.num_inference_steps is None:
-            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
-        else:
-            self.num_inference_steps = config.num_inference_steps
-
-    # ========= inference  ============
-    def conditional_sample(
-        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
-    ) -> Tensor:
-        device = get_device_from_parameters(self)
-        dtype = get_dtype_from_parameters(self)
-
-        # Sample prior.
-        sample = torch.randn(
-            size=(batch_size, self.config.horizon, self.config.output_shapes["action"][0]),
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
-
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-
-        for t in self.noise_scheduler.timesteps:
-            # Predict model output.
-            #TODO: model_output, energy scalar? 
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
-            # Compute previous image: x_t -> x_t-1
-            sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
-
-        return sample
-
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode image features and concatenate them all together along with the state vector."""
-        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
-        global_cond_feats = [batch["observation.state"]]
-        # Extract image feature (first combine batch, sequence, and camera index dims).
-        if self._use_images:
-            img_features = self.rgb_encoder(
-                einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
-            )
-            # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-            # feature dim (effectively concatenating the camera features).
-            img_features = einops.rearrange(
-                img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-            )
-            global_cond_feats.append(img_features)
-
-        if self._use_env_state:
-            global_cond_feats.append(batch["observation.environment_state"])
-
-        # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
-
-    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
-        """
-        This function expects `batch` to have:
-        {
-            "observation.state": (B, n_obs_steps, state_dim)
-
-            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
-                AND/OR
-            "observation.environment_state": (B, environment_dim)
-        }
-        """
-        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
-        assert n_obs_steps == self.config.n_obs_steps
-
-        # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-
-        # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond)
-
-        # Extract `n_action_steps` steps worth of actions (from the current observation).
-        start = n_obs_steps - 1
-        end = start + self.config.n_action_steps
-        actions = actions[:, start:end]
-
-        return actions
-
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """
-        This function expects `batch` to have (at least):
-        {
-            "observation.state": (B, n_obs_steps, state_dim)
-
-            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
-                AND/OR
-            "observation.environment_state": (B, environment_dim)
-
-            "action": (B, horizon, action_dim)
-            "action_is_pad": (B, horizon)
-        }
-        """
-        # Input validation.
-        assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
-        assert "observation.images" in batch or "observation.environment_state" in batch
-        n_obs_steps = batch["observation.state"].shape[1]
-        horizon = batch["action"].shape[1]
-        assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
-
-        # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-
-        # Forward diffusion.
-        trajectory = batch["action"]
-        # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-
-        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
-        #TODO: is this where you find the energy? 
+        out = self.model(x, timestep, global_cond)
+        # IRED Energy Calcs
+            # energy = (y - h).pow(2).sum(dim=-1).sum(dim=-1)[:, None]
+            # x = x.pow(2).sum(dim=[1, 2])[:, None]
+            # output = self.fc4(h).pow(2).sum(dim=-1)[..., None]
+            # energy = output.pow(2).sum(dim=1).sum(dim=1).sum(dim=1)[:, None]
+            # output = output.pow(2).sum(dim=[1, 2, 3])[:, None]
+            # x = self.fc_out(x).squeeze(-1)  # [B, T, N]
+            # x = x.sum(dim=[1, 2])  # [B]
         
+        energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
+        
+        if return_energy:
+            return energy
 
-        # Compute the loss.
-        # The target is either the original trajectory, or the noise.
-        if self.config.prediction_type == "epsilon":
-            target = eps
-        elif self.config.prediction_type == "sample":
-            target = batch["action"]
+        opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0] # is opt_out x? 
+
+        if return_both:
+            return energy, opt_grad
         else:
-            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
-
-        loss = F.mse_loss(pred, target, reduction="none")
-
-        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
-        if self.config.do_mask_loss_for_padding:
-            if "action_is_pad" not in batch:
-                raise ValueError(
-                    "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.config.do_mask_loss_for_padding=}."
-                )
-            in_episode_bound = ~batch["action_is_pad"]
-            loss = loss * in_episode_bound.unsqueeze(-1)
-
-        return loss.mean()
+            return opt_grad
 
 
 class SpatialSoftmax(nn.Module):
@@ -883,198 +709,6 @@ class DiffusionConv1dBlock(nn.Module):
     def forward(self, x):
         return self.block(x)
 
-class EBMWrapper(nn.Module):
-    def __init__(self, model):
-        super(EBMWrapper, self).__init__()
-        self.model = model
-            
-    # def forward(self, inp, opt_out, t, return_energy=False, return_both=False):
-    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None, return_energy=False, return_both=False) -> Tensor:
-        x.requires_grad_(True)
-        # opt_variable = torch.cat([inp, opt_out], dim=-1)
-
-        out = self.model(x, timestep, global_cond)
-        # print(out.shape)
-        # IRED Energy Calcs
-            # energy = (y - h).pow(2).sum(dim=-1).sum(dim=-1)[:, None]
-            # x = x.pow(2).sum(dim=[1, 2])[:, None]
-            # output = self.fc4(h).pow(2).sum(dim=-1)[..., None]
-            # energy = output.pow(2).sum(dim=1).sum(dim=1).sum(dim=1)[:, None]
-            # output = output.pow(2).sum(dim=[1, 2, 3])[:, None]
-            # x = self.fc_out(x).squeeze(-1)  # [B, T, N]
-            # x = x.sum(dim=[1, 2])  # [B]
-        
-        energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
-        # print(energy)
-        
-        if return_energy:
-            return energy
-
-        opt_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0] # is opt_out x? 
-
-        if return_both:
-            return energy, opt_grad
-        else:
-            return opt_grad
-
-# class EBMDiffusionGradWrapper(nn.Module):
-#     def __init__(self, ebm):
-#         super(DiffusionWrapper, self).__init__()
-#         self.ebm = ebm
-#         self.inp_dim = ebm.inp_dim
-#         self.out_dim = ebm.out_dim
-
-#         if hasattr(self.ebm, 'is_ebm'):
-#             assert self.ebm.is_ebm, 'DiffusionWrapper only works for EBMs'
-            
-#     def forward(self, inp, opt_out, t, return_energy=False, return_both=False):
-#         opt_out.requires_grad_(True)
-#         opt_variable = torch.cat([inp, opt_out], dim=-1)
-
-#         energy = self.ebm(opt_variable, t)
-
-#         if return_energy:
-#             return energy
-
-#         opt_grad = torch.autograd.grad([energy.sum()], [opt_out], create_graph=True)[0]
-
-#         if return_both:
-#             return energy, opt_grad
-#         else:
-#             return opt_grad
-
-class DiffusionConditionalUnet1dEBM(nn.Module):
-    """A 1D convolutional UNet with FiLM modulation for conditioning.
-
-    Note: this removes local conditioning as compared to the original diffusion policy code.
-    """
-
-    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
-        super().__init__()
-
-        self.config = config
-
-        # Encoder for the diffusion timestep.
-        self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
-            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
-        )
-
-        # The FiLM conditioning dimension.
-        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
-
-        # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
-        # just reverse these.
-        in_out = [(config.output_shapes["action"][0], config.down_dims[0])] + list(
-            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
-        )
-
-        # Unet encoder.
-        common_res_block_kwargs = {
-            "cond_dim": cond_dim,
-            "kernel_size": config.kernel_size,
-            "n_groups": config.n_groups,
-            "use_film_scale_modulation": config.use_film_scale_modulation,
-        }
-        self.down_modules = nn.ModuleList([])
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (len(in_out) - 1)
-            self.down_modules.append(
-                nn.ModuleList(
-                    [
-                        DiffusionConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
-                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
-                        # Downsample as long as it is not the last block.
-                        nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
-                    ]
-                )
-            )
-
-        # Processing in the middle of the auto-encoder.
-        self.mid_modules = nn.ModuleList(
-            [
-                DiffusionConditionalResidualBlock1d(
-                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
-                ),
-                DiffusionConditionalResidualBlock1d(
-                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
-                ),
-            ]
-        )
-
-        # Unet decoder.
-        self.up_modules = nn.ModuleList([])
-        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
-            is_last = ind >= (len(in_out) - 1)
-            self.up_modules.append(
-                nn.ModuleList(
-                    [
-                        # dim_in * 2, because it takes the encoder's skip connection as well
-                        DiffusionConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
-                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
-                        # Upsample as long as it is not the last block.
-                        nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
-                    ]
-                )
-            )
-
-        self.final_conv = nn.Sequential(
-            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.output_shapes["action"][0], 1),
-        )
-        
-        # self.final_energy = nn.Linear(config.output_shapes["action"][0], 1)
-
-    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
-        """
-        Args:
-            x: (B, T, input_dim) tensor for input to the Unet.
-            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
-            global_cond: (B, global_cond_dim)
-            output: (B, T, input_dim)
-        Returns:
-            (B, T, input_dim) diffusion model prediction.
-        """
-        # For 1D convolutions we'll need feature dimension first.
-        x = einops.rearrange(x, "b t d -> b d t")
-
-        timesteps_embed = self.diffusion_step_encoder(timestep)
-
-        # If there is a global conditioning feature, concatenate it to the timestep embedding.
-        if global_cond is not None:
-            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
-        else:
-            global_feature = timesteps_embed
-
-        # Run encoder, keeping track of skip features to pass to the decoder.
-        encoder_skip_features: list[Tensor] = []
-        for resnet, resnet2, downsample in self.down_modules:
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            encoder_skip_features.append(x)
-            x = downsample(x)
-
-        for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
-
-        # Run decoder, using the skip features from the encoder.
-        for resnet, resnet2, upsample in self.up_modules:
-            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            x = upsample(x)
-
-        x = self.final_conv(x)
-
-        x = einops.rearrange(x, "b d t -> b t d")
-        # print("x.shape", x.shape)
-        
-        # maybe turn into wrapper 
-        # x = self.final_energy(x)
-        # print("x.shape", x.shape)
-        return x
     
 class DiffusionConditionalUnet1d(nn.Module):
     """A 1D convolutional UNet with FiLM modulation for conditioning.
@@ -1200,7 +834,6 @@ class DiffusionConditionalUnet1d(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, "b d t -> b t d")
-        # print("x.shape", x.shape)
         return x
 
 
