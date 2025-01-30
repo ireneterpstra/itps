@@ -43,10 +43,13 @@ import numpy as np
 import pygame
 import random
 import torch
+import copy
 from torch import Tensor, nn
 
 import argparse
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+
 import einops
 from pathlib import Path
 from huggingface_hub import snapshot_download
@@ -63,7 +66,13 @@ import json
 
 import matplotlib.pyplot as plt
 from matplotlib import cm
+from matplotlib.colors import Normalize
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+
 from mpl_toolkits.mplot3d import axes3d
+import pickle as pl
+import datetime
+
 
 class MazeEnv:
     def __init__(self):
@@ -105,6 +114,7 @@ class MazeEnv:
         self.clock = pygame.time.Clock()
         self.agent_gui_pos = np.array([0, 0]) # Initialize the position of the red dot
         self.running = True
+        self.run_id = datetime.datetime.now().strftime('%m.%d.%H.%M.%S')
 
     def check_collision(self, xy_traj):
         assert xy_traj.shape[2] == 2, "Input must be a 2D array of (x, y) coordinates."
@@ -149,6 +159,14 @@ class MazeEnv:
         x = gui[1] / self.gui_size[1] * self.maze.shape[0] - self.offset
         y = gui[0] / self.gui_size[0] * self.maze.shape[1] - self.offset
         return np.array([x, y], dtype=float)
+    
+    def gui2x(self, gui):
+        x = gui / self.gui_size[1] * self.maze.shape[0] - self.offset
+        return x
+    
+    def gui2y(self, gui):
+        y = gui / self.gui_size[0] * self.maze.shape[1] - self.offset
+        return y
 
     def generate_time_color_map(self, num_steps):
         cmap = plt.get_cmap('rainbow')
@@ -228,6 +246,7 @@ class UnconditionalMazeTopo(MazeEnv):
         self.policy_tag = policy_tag
         
     def perturb_trajectory(self, base_trajectory: Tensor):
+        # make a variation where you have mutiple perts
         # print(base_trajectory.shape)
         
         num_traj = base_trajectory.shape[0]
@@ -264,8 +283,9 @@ class UnconditionalMazeTopo(MazeEnv):
     def gen_perturb_energies(self, base_trajectory: Tensor, obs_batch: dict[str, Tensor]):
         perturbed_trajectory = self.perturb_trajectory(base_trajectory)
         # print(perturbed_trajectory.shape)
-        perturbed_energy = self.policy.get_energy(perturbed_trajectory, obs_batch)
-        return perturbed_trajectory, perturbed_energy
+        action_energy = self.policy.get_energy(base_trajectory, copy.deepcopy(obs_batch))
+        perturbed_energy = self.policy.get_energy(perturbed_trajectory, copy.deepcopy(obs_batch))
+        return perturbed_trajectory, perturbed_energy, action_energy
         
         
     def ablate_trajectory(self, base_trajectory: Tensor, eps: float = 3):
@@ -352,40 +372,127 @@ class UnconditionalMazeTopo(MazeEnv):
             guide = torch.from_numpy(guide).float().cuda()
 
         with torch.autocast(device_type="cuda"), seeded_context(0):
-            actions, energy = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer, return_energy=return_energy) # directly call the policy in order to visualize the intermediate steps
-            # gen_perturb_energies(actions[0])
-            perturbed_trajectory, perturbed_energy = self.gen_perturb_energies(actions, obs_batch)
+            
+            obs_i = copy.deepcopy(obs_batch)
+            print(obs_i["observation.state"][0,0,:])
+            actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_perturbed_actions(obs_i, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
+            # # gen_perturb_energies(actions[0])
+            # obs_e = copy.deepcopy(obs_batch)
+            # print(obs_e["observation.state"][0,0,:])
+            # perturbed_trajectory, perturbed_energy, action_e = self.gen_perturb_energies(actions, obs_e)
             
             a_out = actions.detach().cpu().numpy()
-            e_out = np.squeeze(energy.detach().cpu().numpy())
+            e_out = np.squeeze(energy_action.detach().cpu().numpy())
             abl_out = perturbed_trajectory.detach().cpu().numpy()
-            abl_energies = np.squeeze(perturbed_energy.detach().cpu().numpy())
+            abl_energies = np.squeeze(energy_perturbed.detach().cpu().numpy())
             # print(a_out.shape, e_out.shape, abl_out.shape, abl_energies.shape)
             return a_out[0:3, :, :], e_out[0:3], abl_out[0:3, :, :], abl_energies[0:3]
 
+
+    def imshow3d(self, ax, array, value_direction='z', pos=0, norm=None, cmap=None):
+        """
+        Display a 2D array as a  color-coded 2D image embedded in 3d.
+
+        The image will be in a plane perpendicular to the coordinate axis *value_direction*.
+
+        Parameters
+        ----------
+        ax : Axes3D
+            The 3D Axes to plot into.
+        array : 2D numpy array
+            The image values.
+        value_direction : {'x', 'y', 'z'}
+            The axis normal to the image plane.
+        pos : float
+            The numeric value on the *value_direction* axis at which the image plane is
+            located.
+        norm : `~matplotlib.colors.Normalize`, default: Normalize
+            The normalization method used to scale scalar data. See `imshow()`.
+        cmap : str or `~matplotlib.colors.Colormap`, default: :rc:`image.cmap`
+            The Colormap instance or registered colormap name used to map scalar data
+            to colors.
+        """
+        if norm is None:
+            norm = Normalize()
+        colors = plt.get_cmap(cmap)(norm(array))
+
+        if value_direction == 'x':
+            nz, ny = array.shape
+            zi, yi = np.mgrid[0:nz + 1, 0:ny + 1]
+            xi = np.full_like(yi, pos)
+        elif value_direction == 'y':
+            nx, nz = array.shape
+            xi, zi = np.mgrid[0:nx + 1, 0:nz + 1]
+            yi = np.full_like(zi, pos)
+        elif value_direction == 'z':
+            ny, nx = array.shape
+            yi, xi = np.mgrid[0:ny + 1, 0:nx + 1]
+            zi = np.full_like(xi, pos)
+        else:
+            raise ValueError(f"Invalid value_direction: {value_direction!r}")
+        # xi = self.gui2x(xi)
+        # yi = self.gui2y(yi)
+        xi = xi - 0.5
+        yi = yi - 0.5
+        print(xi)
+        print(yi)
+        print(zi)
+        ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.75)
+
     def plot_energies(self, xy, energies, name=""):
-        ax = plt.figure().add_subplot(projection='3d')
+        fig = plt.figure()
+        ax = fig.add_subplot(projection='3d')
+        maze = np.swapaxes(self.maze, 0, 1)
+        print(maze.shape)
+        self.imshow3d(ax, maze, cmap="binary")
         # X, Y, Z = axes3d.get_test_data(0.05)
         X = xy[:, :, 0]
         Y = xy[:, :, 1]
+        print(X)
+        print(Y)
         # energies = np.array([0,0,0,3,3,3])
         energies = einops.rearrange(energies, "n -> 1 n")
         energy_colors = self.generate_energy_color_map(energies)
         
         Z = np.repeat(energies.T, xy.shape[1], axis=1)
-        print(energies)
-        print(X.shape)
-        print(Y.shape)
-        print(Z.shape)
+        # print(energies)
+        # print(X.shape)
+        # print(Y.shape)
+        # print(Z.shape)
         # cmap = plt.get/_cmap('rainbow')
         
-        for i in range(xy.shape[0]):
-            # color = (energy_colors[i, :3] * 255).astype(int)
-            ax.plot(X[i], Y[i], Z[i], color="skyblue")  # Plot contour curves
-        ax.scatter(X, Y, Z, c=Z, cmap='rainbow', s=2)
-        ax.plot_surface(self.maze)
+        colors = mpl.colormaps['tab20'].colors
+        c = np.tile(np.arange(int(xy.shape[0]/2)), 2)
+        print(c)
+        C = einops.rearrange(c, "n -> 1 n")
+        C = np.repeat(C.T, xy.shape[1], axis=1)
+        print(C)
+        cmap = ListedColormap(["darkorange", "lawngreen", "lightseagreen"]) #"lawngreen", 
+        colors = cmap(c)
         
-        plt.savefig('plots/energy_plot_'+ name +'.png', bbox_inches='tight')
+        # for i in range(int(xy.shape[0])):
+        for i, color in enumerate(colors):
+            # color = (energy_colors[i, :3] * 255).astype(int)
+            ax.plot(X[i], Y[i], Z[i], color=color)  # Plot contour curves
+        
+        # colors = plt.get_cmap(cmap)(norm(C))
+        # norm = Normalize()
+        # C = norm(C) * 100
+        print(C)
+# plot_examples([cmap])
+        ax.scatter(X, Y, Z, c=C, cmap=cmap, s=4)
+        
+        #colors = plt.get_cmap(cmap)(self.maze)
+        
+        plt.show()
+        
+        
+        # save_dir = 'plots/' + self.run_id + '/'
+        # if not os.path.isdir(save_dir): 
+        #     os.mkdir(save_dir) 
+        # plt.savefig(save_dir + 'energy_plot_'+ name +'.png', bbox_inches='tight')
+        # with open(save_dir + 'energy_plot_'+ name +'.pickle', 'wb') as f:
+        #     pl.dump(fig, f)
 
     def update_mouse_pos(self):
         self.mouse_pos = np.array(pygame.mouse.get_pos())

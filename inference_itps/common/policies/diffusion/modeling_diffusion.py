@@ -118,6 +118,21 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
 
         return actions
     
+    def sample_perturbed_actions(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None):
+        observation_batch = self.normalize_inputs(observation_batch)
+        if guide is not None:
+            guide = self.normalize_targets({"action": guide})["action"]
+        if len(self.expected_image_keys) > 0:
+            observation_batch["observation.images"] = torch.stack(
+                [observation_batch[k] for k in self.expected_image_keys], dim=-4
+            )
+        actions, energy_action, perturbed_traj, energy_pert = self.diffusion.generate_perturbed_actions(observation_batch, guide=guide, visualizer=visualizer)
+        
+        actions = self.unnormalize_outputs({"action": actions})["action"]
+        perturbed_traj = self.unnormalize_outputs({"action": perturbed_traj})["action"]
+        
+        return actions, energy_action, perturbed_traj, energy_pert
+    
     def get_energy(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
         observation_batch = self.normalize_inputs(observation_batch)
         if len(self.expected_image_keys) > 0:
@@ -212,7 +227,7 @@ class EBMDiffusionModel(nn.Module):
 
     # ========= inference  ============
     def conditional_sample(
-        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False
+        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, guide: Tensor | None = None, visualizer=None, normalizer=None
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -291,15 +306,6 @@ class EBMDiffusionModel(nn.Module):
                 else:
                     # print('final diffusion step at t:', t)
                     sample = prev_sample  
-                        
-        if return_energy:
-            # print("sample", sample.shape)
-            # print(t)
-            energy = self.model(
-                            sample,
-                            torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                            global_cond=global_cond, return_energy=True)
-            return sample, energy
         
         return sample
     
@@ -347,7 +353,7 @@ class EBMDiffusionModel(nn.Module):
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False, get_pret = False) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -361,15 +367,19 @@ class EBMDiffusionModel(nn.Module):
         batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps, f"{n_obs_steps=} {self.config.n_obs_steps=}"
 
+        # print("observation_batch get", batch)
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        if return_energy: 
-            actions, energy = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer, return_energy=return_energy)
-        else: 
-            actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
 
+        if return_energy:
+            energy = self.model(
+                        actions,
+                        torch.full(actions.shape[:1], 0, dtype=torch.long, device=sample.device),
+                        global_cond=global_cond, return_energy=True)
+        #     return sample, energy
         # print("generate actions", actions.shape)
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
@@ -381,6 +391,90 @@ class EBMDiffusionModel(nn.Module):
             return actions, energy # does cutting off the end make the energy calc wrong? 
         
         return actions 
+    
+    
+    def generate_perturbed_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None) -> Tensor:
+        """
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+        }
+        """
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps, f"{n_obs_steps=} {self.config.n_obs_steps=}"
+
+        # print("observation_batch get", batch)
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        # run sampling
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
+
+         
+        perturbed_traj = self.perturb_trajectory(actions)
+        
+        timesteps = torch.full(actions.shape[:1], 0, dtype=torch.long, device=actions.device)
+        global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+        traj_concat = torch.cat([actions, perturbed_traj], dim=0)
+        t_concat = torch.cat([timesteps, timesteps], dim=0)
+        energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+
+        energy_action, energy_pert = torch.chunk(energy, 2, 0)
+            
+        start = n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        actions = actions[:, start:end]
+        perturbed_traj = perturbed_traj[:, start:end]
+        
+        # print("extract actions", actions.shape, start, end)
+
+        
+        return actions, energy_action, perturbed_traj, energy_pert # does cutting off the end make the energy calc wrong?
+        
+        # return actions 
+    
+    def perturb_trajectory(self, base_trajectory: Tensor) -> Tensor:
+        """
+        This function expects `base_trajectory` to be a batch of trajectories:
+        
+        """
+        # make a variation where you have mutiple perts
+        # print(base_trajectory.shape)
+        
+        num_traj = base_trajectory.shape[0]
+        traj_len = base_trajectory.shape[1]
+        # print("traj_len", traj_len)
+                
+        impulse_start = (traj_len-2) * torch.rand(num_traj).to(base_trajectory.device) # np.random.randint(0, traj_len-2) 
+        impulse_end = torch.mul((traj_len-1 - impulse_start+1), torch.rand(num_traj).to(base_trajectory.device)) + impulse_start+1 # np.random.randint(impulse_start+1, traj_len-1)
+        impulse_start = einops.rearrange(impulse_start, "n -> n 1")
+        impulse_end = einops.rearrange(impulse_end, "n -> n 1")
+        impulse_mean = (impulse_start + impulse_end)/2
+        # self.gui_size = (1200, 900)
+        # print("impulse start, end", impulse_start[0], impulse_end[0])
+        center_index = torch.round(impulse_mean).squeeze()
+        impulse_center_x = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 0]
+        impulse_center_y = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 1]
+        impulse_target_x = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_x - 1 # np.random.uniform(-2, 2, size=(num_traj,)) # -8, 8
+        impulse_target_x = einops.rearrange(impulse_target_x, "n -> n 1")
+        impulse_target_y = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_y - 1 # np.random.uniform(-8, 8, size=(num_traj,)) # -8, 8
+        impulse_target_y = einops.rearrange(impulse_target_y, "n -> n 1")
+        max_relative_dist = 1 # np.exp(-5) ~= 0.006
+        # print("impulse target 1", impulse_target_x[0], impulse_target_y[0])
+        
+        
+        kernel = torch.exp(-max_relative_dist*(torch.Tensor(range(traj_len)).to(base_trajectory.device).view(1, -1) 
+                                               - impulse_mean)**2 / ((impulse_start-impulse_mean)**2))
+        # print(kernel)
+        perturbed = base_trajectory.clone()
+        perturbed[:, :, 1] += (impulse_target_y-perturbed[:, :, 1])*kernel
+        perturbed[:, :, 0] += (impulse_target_x-perturbed[:, :, 0])*kernel
+        
+        return perturbed
     
     def get_energy_from_traj(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
         x_traj = torch.cat((trajectories, trajectories[:, -1:, :]), 1)
@@ -398,7 +492,8 @@ class EBMDiffusionModel(nn.Module):
         # print(timesteps)
         global_cond = self._prepare_global_conditioning(observation_batch)
         
-        
+        # print("global_cond traj", global_cond)
+        # print("observation_batch traj", observation_batch)
         energies = self.model(x_traj, timesteps, global_cond=global_cond, return_energy=True)
         
         return energies
