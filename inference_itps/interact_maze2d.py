@@ -41,7 +41,10 @@
 import sys, os
 import numpy as np
 import pygame
+import random
 import torch
+from torch import Tensor, nn
+
 import argparse
 import matplotlib.pyplot as plt
 import einops
@@ -53,9 +56,14 @@ from common.policies.rollout_wrapper import PolicyRolloutWrapper
 from common.utils.utils import seeded_context, init_hydra_config
 from common.policies.factory import make_policy
 from common.datasets.factory import make_dataset
+from common.utils.path_utils import perturb_traj, generate_trajs
 from scipy.special import softmax
 import time
 import json
+
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.mplot3d import axes3d
 
 class MazeEnv:
     def __init__(self):
@@ -207,6 +215,227 @@ class MazeEnv:
         samples = samples[sort_idx]
         scores = scores[sort_idx]  
         return samples, scores
+    
+    
+class UnconditionalMazeTopo(MazeEnv):
+    # for dragging the agent around to explore motion manifold with energy topo
+    def __init__(self, policy, policy_tag=None):
+        super().__init__()
+        self.mouse_pos = None
+        self.agent_in_collision = False
+        self.agent_history_xy = []
+        self.policy = policy
+        self.policy_tag = policy_tag
+        
+    def perturb_trajectory(self, base_trajectory: Tensor):
+        # print(base_trajectory.shape)
+        
+        num_traj = base_trajectory.shape[0]
+        traj_len = base_trajectory.shape[1]
+        # print("traj_len", traj_len)
+                
+        impulse_start = (traj_len-2) * torch.rand(num_traj).to(base_trajectory.device) # np.random.randint(0, traj_len-2) 
+        impulse_end = torch.mul((traj_len-1 - impulse_start+1), torch.rand(num_traj).to(base_trajectory.device)) + impulse_start+1 # np.random.randint(impulse_start+1, traj_len-1)
+        impulse_start = einops.rearrange(impulse_start, "n -> n 1")
+        impulse_end = einops.rearrange(impulse_end, "n -> n 1")
+        impulse_mean = (impulse_start + impulse_end)/2
+        # self.gui_size = (1200, 900)
+        # print("impulse start, end", impulse_start[0], impulse_end[0])
+        center_index = torch.round(impulse_mean).squeeze()
+        impulse_center_x = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 0]
+        impulse_center_y = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 1]
+        impulse_target_x = 4 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_x - 2 # np.random.uniform(-2, 2, size=(num_traj,)) # -8, 8
+        impulse_target_x = einops.rearrange(impulse_target_x, "n -> n 1")
+        impulse_target_y = 4 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_y - 2 # np.random.uniform(-8, 8, size=(num_traj,)) # -8, 8
+        impulse_target_y = einops.rearrange(impulse_target_y, "n -> n 1")
+        max_relative_dist = 1 # np.exp(-5) ~= 0.006
+        # print("impulse target 1", impulse_target_x[0], impulse_target_y[0])
+        
+        
+        kernel = torch.exp(-max_relative_dist*(torch.Tensor(range(traj_len)).to(base_trajectory.device).view(1, -1) 
+                                               - impulse_mean)**2 / ((impulse_start-impulse_mean)**2))
+        # print(kernel)
+        perturbed = base_trajectory.clone()
+        perturbed[:, :, 1] += (impulse_target_y-perturbed[:, :, 1])*kernel
+        perturbed[:, :, 0] += (impulse_target_x-perturbed[:, :, 0])*kernel
+        
+        return perturbed
+    
+    def gen_perturb_energies(self, base_trajectory: Tensor, obs_batch: dict[str, Tensor]):
+        perturbed_trajectory = self.perturb_trajectory(base_trajectory)
+        # print(perturbed_trajectory.shape)
+        perturbed_energy = self.policy.get_energy(perturbed_trajectory, obs_batch)
+        return perturbed_trajectory, perturbed_energy
+        
+        
+    def ablate_trajectory(self, base_trajectory: Tensor, eps: float = 3):
+        noise = (1+0.1*eps) * torch.randn((base_trajectory.shape[0], base_trajectory.shape[-1]), device=base_trajectory.device)
+        noise_unsqueezed = noise.unsqueeze(0)
+        shift = noise_unsqueezed.repeat_interleave(base_trajectory.shape[1], 0)
+        shift = einops.rearrange(shift, "n b c -> b n c")
+        ablated_trajectories = shift + base_trajectory
+    
+        return ablated_trajectories
+    
+    def gen_ablation_energies(self, base_trajectory: Tensor, obs_batch: dict[str, Tensor], num_eps:int = 3):
+        ablated_trajectories = torch.empty((num_eps,) + base_trajectory.shape, device=base_trajectory.device)
+        ablated_energies = torch.empty((num_eps,) + (base_trajectory.shape[0],1), device=base_trajectory.device)
+        
+        for i in range(num_eps): 
+            ablated_traj = self.ablate_trajectory(base_trajectory, i+1)
+            energy = self.policy.get_energy(ablated_traj, obs_batch)
+            
+            ablated_trajectories[i, :] = ablated_traj
+            ablated_energies[i, :] = energy
+        
+        ablated_trajectories = einops.rearrange(ablated_trajectories, "a b ... -> (a b) ...")
+        ablated_energies = einops.rearrange(ablated_energies, "a b ... -> (a b) ...")
+        
+        return ablated_trajectories, ablated_energies
+        
+        
+    def generate_energy_color_map(self, energies):
+        num_es = len(energies)
+        cmap = plt.get_cmap('rainbow')
+        energies_norm = (energies-np.min(energies))/(np.max(energies)-np.min(energies))
+        # values = np.linspace(0, 1, num_es)
+        # print("min - max energies", np.min(energies), np.max(energies))
+        colors = cmap(energies_norm)
+        return colors
+        
+    def update_screen_energy(self, xy_pred=None, energies=None, collisions=None):
+        self.draw_maze_background()
+        if xy_pred is not None:
+            energy_colors = self.generate_energy_color_map(energies)
+            if collisions is None:
+                collisions = self.check_collision(xy_pred)
+            # self.report_collision_percentage(collisions)
+            for idx, pred in enumerate(xy_pred):
+                color = (energy_colors[idx, :3] * 255).astype(int)
+                for step_idx in range(len(pred) - 1):
+                    # color = (time_colors[step_idx, :3] * 255).astype(int)
+                    
+                    # visualize constraint violations (collisions) by tinting trajectories white
+                    whiteness_factor = 0.1 if collisions[idx] else 0.0 
+                    # color = self.blend_with_white(color, whiteness_factor)
+                    if idx < 32: 
+                        circle_size = 5
+                    else: 
+                        circle_size = 2
+                    
+                    start_pos = self.xy2gui(pred[step_idx])
+                    end_pos = self.xy2gui(pred[step_idx + 1])
+                    pygame.draw.circle(self.screen, color, start_pos, circle_size)
+
+        pygame.draw.circle(self.screen, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 20)
+  
+        pygame.display.flip()
+
+    def infer_target(self, guide=None, visualizer=None, return_energy=False, return_topo=False):
+        agent_hist_xy = self.agent_history_xy[-1] 
+        agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
+        if self.policy_tag[:2] == 'dp':
+            agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
+
+        obs_batch = {
+            "observation.state": einops.repeat(
+                torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+            )
+        }
+        obs_batch["observation.environment_state"] = einops.repeat(
+            torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+        )
+        
+        # print("batch size", self.batch_size)
+        
+        if guide is not None:
+            guide = torch.from_numpy(guide).float().cuda()
+
+        with torch.autocast(device_type="cuda"), seeded_context(0):
+            actions, energy = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer, return_energy=return_energy) # directly call the policy in order to visualize the intermediate steps
+            # gen_perturb_energies(actions[0])
+            perturbed_trajectory, perturbed_energy = self.gen_perturb_energies(actions, obs_batch)
+            
+            a_out = actions.detach().cpu().numpy()
+            e_out = np.squeeze(energy.detach().cpu().numpy())
+            abl_out = perturbed_trajectory.detach().cpu().numpy()
+            abl_energies = np.squeeze(perturbed_energy.detach().cpu().numpy())
+            # print(a_out.shape, e_out.shape, abl_out.shape, abl_energies.shape)
+            return a_out[0:3, :, :], e_out[0:3], abl_out[0:3, :, :], abl_energies[0:3]
+
+    def plot_energies(self, xy, energies, name=""):
+        ax = plt.figure().add_subplot(projection='3d')
+        # X, Y, Z = axes3d.get_test_data(0.05)
+        X = xy[:, :, 0]
+        Y = xy[:, :, 1]
+        # energies = np.array([0,0,0,3,3,3])
+        energies = einops.rearrange(energies, "n -> 1 n")
+        energy_colors = self.generate_energy_color_map(energies)
+        
+        Z = np.repeat(energies.T, xy.shape[1], axis=1)
+        print(energies)
+        print(X.shape)
+        print(Y.shape)
+        print(Z.shape)
+        # cmap = plt.get/_cmap('rainbow')
+        
+        for i in range(xy.shape[0]):
+            # color = (energy_colors[i, :3] * 255).astype(int)
+            ax.plot(X[i], Y[i], Z[i], color="skyblue")  # Plot contour curves
+        ax.scatter(X, Y, Z, c=Z, cmap='rainbow', s=2)
+        ax.plot_surface(self.maze)
+        
+        plt.savefig('plots/energy_plot_'+ name +'.png', bbox_inches='tight')
+
+    def update_mouse_pos(self):
+        self.mouse_pos = np.array(pygame.mouse.get_pos())
+
+    def update_agent_pos(self, new_agent_pos, history_len=1):
+        self.agent_gui_pos = np.array(new_agent_pos)
+        agent_xy_pos = self.gui2xy(self.agent_gui_pos)
+        self.agent_in_collision = self.check_collision(agent_xy_pos.reshape(1, 1, 2))[0]
+        if self.agent_in_collision:
+            self.agent_color = self.blend_with_white(self.RED, 0.8)
+        else:
+            self.agent_color = self.RED        
+        self.agent_history_xy.append(agent_xy_pos)
+        self.agent_history_xy = self.agent_history_xy[-history_len:]
+        
+    
+
+    def run(self):
+        i = 0
+        while self.running:
+            self.update_mouse_pos()
+            
+            # Handle events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    break
+                if event.type == pygame.KEYDOWN: 
+                    # press s to save the trial
+                    if event.key == pygame.K_s:
+                        self.plot_energies(xy, energies, name = str(i)) 
+
+            self.update_agent_pos(self.mouse_pos.copy())
+            xy_pred, xy_energy, xy_topo, xy_topo_energy = self.infer_target(return_energy=True, return_topo=True)
+            # print(xy_pred.shape, xy_energy.shape)
+            # print(xy_topo.shape, xy_topo_energy.shape)
+            
+            xy = np.vstack((xy_pred, xy_topo))
+            energies = np.concatenate((xy_energy, xy_topo_energy))
+            
+            # print(i)
+            self.update_screen_energy(xy, energies)
+            # if i % 20 ==0 and i > 4: 
+                
+            #     self.plot_energies(xy, energies)
+            
+            self.clock.tick(30)
+            i += 1
+
+        pygame.quit()
 
 class UnconditionalMaze(MazeEnv):
     # for dragging the agent around to explore motion manifold
@@ -464,6 +693,7 @@ if __name__ == "__main__":
     parser.add_argument('-c', "--checkpoint", type=str, help="Path to the checkpoint")
     parser.add_argument('-p', '--policy', required=True, type=str, help="Policy name")
     parser.add_argument('-u', '--unconditional', action='store_true', help="Unconditional Maze")
+    parser.add_argument('-ut', '--topo', action='store_true', help="Unconditional Topo Maze")
     parser.add_argument('-op', '--output-perturb', action='store_true', help="Output perturbation")
     parser.add_argument('-ph', '--post-hoc', action='store_true', help="Post-hoc ranking")
     parser.add_argument('-bi', '--biased-initialization', action='store_true', help="Biased initialization")
@@ -494,6 +724,8 @@ if __name__ == "__main__":
         checkpoint_path = 'weights_dp'
     elif args.policy in ["dp_ebm"]:
         checkpoint_path = 'weights_maze2d_energy_dp_100k'
+    elif args.policy in ["dp_ebm_n"]:
+        checkpoint_path = 'weights_maze2d_dp_ebm_p_noise_100k'
     elif args.policy in ["act"]:
         checkpoint_path = 'weights_act'
     else:
@@ -511,7 +743,7 @@ if __name__ == "__main__":
         policy_tag = 'dp'
         policy.cuda()
         policy.eval()
-    elif args.policy in ["dp_ebm"]:
+    elif args.policy in ["dp_ebm", "dp_ebm_n"]:
         policy = DiffusionPolicy.from_pretrained(pretrained_policy_path, alignment_strategy=alignment_strategy)
         policy.config.noise_scheduler_type = "DDIM"
         policy.diffusion.num_inference_steps = 10
@@ -528,7 +760,9 @@ if __name__ == "__main__":
         policy = None
         policy_tag = None
 
-    if args.unconditional:
+    if args.topo and policy_tag in ["dp_ebm"]:
+        interactiveMaze = UnconditionalMazeTopo(policy, policy_tag=policy_tag)
+    elif args.unconditional: 
         interactiveMaze = UnconditionalMaze(policy, policy_tag=policy_tag)
     elif args.loadpath is not None:
         if args.savepath is None:

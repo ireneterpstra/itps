@@ -98,7 +98,7 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
         return set(self.config.input_shapes)
 
     @torch.no_grad
-    def run_inference(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None) -> Tensor:
+    def run_inference(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, return_energy=False) -> Tensor:
         observation_batch = self.normalize_inputs(observation_batch)
         if guide is not None:
             guide = self.normalize_targets({"action": guide})["action"]
@@ -106,9 +106,26 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
             observation_batch["observation.images"] = torch.stack(
                 [observation_batch[k] for k in self.expected_image_keys], dim=-4
             )
-        actions = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self)
+        if return_energy: 
+            actions, energy = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self, return_energy=return_energy)
+        else: 
+            actions = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self)
+
         actions = self.unnormalize_outputs({"action": actions})["action"]
+        
+        if return_energy: 
+            return actions, energy
+
         return actions
+    
+    def get_energy(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
+        observation_batch = self.normalize_inputs(observation_batch)
+        if len(self.expected_image_keys) > 0:
+            observation_batch["observation.images"] = torch.stack(
+                [observation_batch[k] for k in self.expected_image_keys], dim=-4
+            )
+        return self.diffusion.get_energy_from_traj(trajectories, observation_batch)
+            
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -195,7 +212,7 @@ class EBMDiffusionModel(nn.Module):
 
     # ========= inference  ============
     def conditional_sample(
-        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, guide: Tensor | None = None, visualizer=None, normalizer=None
+        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -273,9 +290,21 @@ class EBMDiffusionModel(nn.Module):
                     sample = self.noise_scheduler.add_noise(clean_sample, noise, t)
                 else:
                     # print('final diffusion step at t:', t)
-                    sample = prev_sample
-
+                    sample = prev_sample  
+                        
+        if return_energy:
+            # print("sample", sample.shape)
+            # print(t)
+            energy = self.model(
+                            sample,
+                            torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                            global_cond=global_cond, return_energy=True)
+            return sample, energy
+        
         return sample
+    
+    
+
     
     def guide_gradient(self, naction, guide):
         # naction: (B, pred_horizon, action_dim);
@@ -318,7 +347,7 @@ class EBMDiffusionModel(nn.Module):
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -336,14 +365,43 @@ class EBMDiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
+        if return_energy: 
+            actions, energy = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer, return_energy=return_energy)
+        else: 
+            actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
 
+        # print("generate actions", actions.shape)
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
+        # print("extract actions", actions.shape, start, end)
 
-        return actions
+        if return_energy: 
+            return actions, energy # does cutting off the end make the energy calc wrong? 
+        
+        return actions 
+    
+    def get_energy_from_traj(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
+        x_traj = torch.cat((trajectories, trajectories[:, -1:, :]), 1)
+        # timesteps = torch.randint(
+        #     low=0,
+        #     high=self.noise_scheduler.config.num_train_timesteps,
+        #     size=(traj.shape[0],), 
+        #     device = device
+        # ).long()
+        
+        # t = self.config.num_inference_steps
+        t = self.noise_scheduler.timesteps
+        # print(t) # why is it 0 at the end? 
+        timesteps = torch.full((x_traj.shape[0],), 0, dtype=torch.long, device=x_traj.device)
+        # print(timesteps)
+        global_cond = self._prepare_global_conditioning(observation_batch)
+        
+        
+        energies = self.model(x_traj, timesteps, global_cond=global_cond, return_energy=True)
+        
+        return energies
     
     def opt_step(self, traj, t, global_cond=None, step=5, eval=True, sf=1.0, detach=True):
         with torch.enable_grad():

@@ -385,7 +385,7 @@ class EBMDiffusionModel(nn.Module):
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.model(noisy_trajectory, timesteps, global_cond=global_cond)
        
-        summary(self.model)
+        # summary(self.model)
         
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
@@ -425,15 +425,15 @@ class EBMDiffusionModel(nn.Module):
             xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
             ##### how neccesary is this?? retrain w/o this
-            xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0)
-            xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
-            loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+            # xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0)
+            # xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
+            # loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
             
-            xmin_noise = xmin_noise.detach()
-            xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
-            xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
+            # xmin_noise = xmin_noise.detach()
+            # xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
+            # xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
             
-            xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
+            # xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
             ##### how neccesary is this? retrain w/o this
             
             loss_scale = 0.5
@@ -456,7 +456,7 @@ class EBMDiffusionModel(nn.Module):
             
             loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
 
-            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_opt.mean())
+            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
         else:
             loss = loss_mse
             return loss.mean(), (loss_mse.mean(), torch.tensor(-1), torch.tensor(-1))
