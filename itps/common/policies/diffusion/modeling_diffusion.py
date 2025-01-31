@@ -341,6 +341,60 @@ class EBMDiffusionModel(nn.Module):
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
+        
+    def perturb_trajectory(self, base_trajectory: Tensor, number) -> Tensor:
+        """
+        TODO: move to utils
+        Take trajectory and add a detour at a random location in the traj
+        TODO: is this the rigt eay to samle ranomly
+        """
+        # make a variation where you have mutiple perts
+        
+        num_traj = base_trajectory.shape[0]
+        traj_len = base_trajectory.shape[1]
+        # print("traj_len", traj_len)
+                
+        impulse_start = (traj_len-2) * torch.rand(num_traj).to(base_trajectory.device) # np.random.randint(0, traj_len-2) 
+        impulse_end = torch.mul((traj_len-1 - impulse_start+1), torch.rand(num_traj).to(base_trajectory.device)) + impulse_start+1 # np.random.randint(impulse_start+1, traj_len-1)
+        impulse_start = einops.rearrange(impulse_start, "n -> n 1")
+        impulse_end = einops.rearrange(impulse_end, "n -> n 1")
+        impulse_mean = (impulse_start + impulse_end)/2
+        # self.gui_size = (1200, 900)
+        # print("impulse start, end", impulse_start[0], impulse_end[0])
+        center_index = torch.round(impulse_mean).squeeze()
+        impulse_center_x = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 0]
+        impulse_center_y = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 1]
+        impulse_target_x = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_x - 1 # np.random.uniform(-2, 2, size=(num_traj,)) # -8, 8
+        impulse_target_x = einops.rearrange(impulse_target_x, "n -> n 1")
+        impulse_target_y = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_y - 1 # np.random.uniform(-8, 8, size=(num_traj,)) # -8, 8
+        impulse_target_y = einops.rearrange(impulse_target_y, "n -> n 1")
+        max_relative_dist = 1 # np.exp(-5) ~= 0.006
+        # print("impulse target 1", impulse_target_x[0], impulse_target_y[0])
+        
+        
+        kernel = torch.exp(-max_relative_dist*(torch.Tensor(range(traj_len)).to(base_trajectory.device).view(1, -1) 
+                                               - impulse_mean)**2 / ((impulse_start-impulse_mean)**2))
+        # print(kernel)
+        perturbed = base_trajectory.clone()
+        perturbed[:, :, 1] += (impulse_target_y-perturbed[:, :, 1])*kernel
+        perturbed[:, :, 0] += (impulse_target_x-perturbed[:, :, 0])*kernel
+        
+        return perturbed
+    
+
+    def check_collision(self, xy_traj):
+        """
+        This feels wrong because I am using privilaged info? Or does this not matter 
+        """
+        assert xy_traj.shape[2] == 2, "Input must be a 2D array of (x, y) coordinates."
+        batch_size, num_steps, _ = xy_traj.shape
+        xy_traj = xy_traj.reshape(-1, 2)
+        xy_traj = np.clip(xy_traj, [0, 0], [self.maze.shape[0] - 1, self.maze.shape[1] - 1])
+        maze_x = np.round(xy_traj[:, 0]).astype(int)
+        maze_y = np.round(xy_traj[:, 1]).astype(int)
+        collisions = self.maze[maze_x, maze_y]
+        collisions = collisions.reshape(batch_size, num_steps)
+        return np.any(collisions, axis=1)
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
@@ -423,6 +477,11 @@ class EBMDiffusionModel(nn.Module):
             
             # Curruption Function: construct a set of negative labels
             xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+            
+            pert_traj = self.perturb_trajectory(trajectory)
+
+            # check collision
+            # TODO: non collision paths should be re sampled or labled as good? 
             
             ##### how neccesary is this?? retrain w/o this
             # xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0)
