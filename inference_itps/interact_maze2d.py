@@ -833,6 +833,8 @@ if __name__ == "__main__":
         checkpoint_path = 'weights_maze2d_energy_dp_100k'
     elif args.policy in ["dp_ebm_n"]:
         checkpoint_path = 'weights_maze2d_dp_ebm_p_noise_100k'
+    elif args.policy in ["dp_ebm_p"]:
+        checkpoint_path = 'weights_maze2d_dp_ebm_pert_100k'
     elif args.policy in ["act"]:
         checkpoint_path = 'weights_act'
     else:
@@ -850,7 +852,7 @@ if __name__ == "__main__":
         policy_tag = 'dp'
         policy.cuda()
         policy.eval()
-    elif args.policy in ["dp_ebm", "dp_ebm_n"]:
+    elif args.policy in ["dp_ebm", "dp_ebm_n", "dp_ebm_p"]:
         policy = DiffusionPolicy.from_pretrained(pretrained_policy_path, alignment_strategy=alignment_strategy)
         policy.config.noise_scheduler_type = "DDIM"
         policy.diffusion.num_inference_steps = 10

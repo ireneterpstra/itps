@@ -23,7 +23,7 @@ Download the pre-trained weights for [Diffusion Policy with Energy Model](https:
 
 #### From the repo folder: 
 ```
-python itps/scripts/train.py policy=maze2d_dp_eb env=maze2d
+python itps/scripts/train.py policy=maze2d_dp_ebm env=maze2d
 ```
 This will save your weights to `data/maze2d_dp/outputs/(date)/`
 

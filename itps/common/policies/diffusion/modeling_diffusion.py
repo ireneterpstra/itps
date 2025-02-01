@@ -342,11 +342,11 @@ class EBMDiffusionModel(nn.Module):
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
         
-    def perturb_trajectory(self, base_trajectory: Tensor, number) -> Tensor:
+    def perturb_trajectory(self, base_trajectory: Tensor) -> Tensor:
         """
         TODO: move to utils
         Take trajectory and add a detour at a random location in the traj
-        TODO: is this the rigt eay to samle ranomly
+        TODO: is this the right way to sample ranomly
         """
         # make a variation where you have mutiple perts
         
@@ -359,6 +359,7 @@ class EBMDiffusionModel(nn.Module):
         impulse_start = einops.rearrange(impulse_start, "n -> n 1")
         impulse_end = einops.rearrange(impulse_end, "n -> n 1")
         impulse_mean = (impulse_start + impulse_end)/2
+        # print("impulse_mean", impulse_mean)
         # self.gui_size = (1200, 900)
         # print("impulse start, end", impulse_start[0], impulse_end[0])
         center_index = torch.round(impulse_mean).squeeze()
@@ -476,9 +477,11 @@ class EBMDiffusionModel(nn.Module):
             data_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps) # self.q_sample(x_start = x_start, t = t, noise = noise)
             
             # Curruption Function: construct a set of negative labels
-            xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+            # xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
-            pert_traj = self.perturb_trajectory(trajectory)
+            pret_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+            pert_traj = self.perturb_trajectory(pret_sample)
+            
 
             # check collision
             # TODO: non collision paths should be re sampled or labled as good? 
@@ -499,7 +502,7 @@ class EBMDiffusionModel(nn.Module):
             
             # Compute energy of both distributions
             global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
-            traj_concat = torch.cat([data_sample, xmin_noise], dim=0)
+            traj_concat = torch.cat([data_sample, pert_traj], dim=0)
             # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
             t_concat = torch.cat([timesteps, timesteps], dim=0)
             energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
