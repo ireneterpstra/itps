@@ -12,4 +12,5 @@ itps/train_test/*
 train_test/*
 outputs/*
 data/*
+inference_itps/plots
 maze2d-large-sparse-v1.hdf5

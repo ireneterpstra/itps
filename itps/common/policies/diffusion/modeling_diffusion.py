@@ -479,11 +479,16 @@ class EBMDiffusionModel(nn.Module):
             # Curruption Function: construct a set of negative labels
             # xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
-            pret_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-            pert_traj = self.perturb_trajectory(pret_sample)
             
 
-            # check collision
+            if torch.rand(1) > 0.4: 
+                pert_traj = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps)
+            else: 
+                pret_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+                pert_traj = self.perturb_trajectory(pret_sample)
+            
+
+            # check collisions
             # TODO: non collision paths should be re sampled or labled as good? 
             
             ##### how neccesary is this?? retrain w/o this
