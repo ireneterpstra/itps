@@ -351,7 +351,7 @@ class UnconditionalMazeTopo(MazeEnv):
   
         pygame.display.flip()
 
-    def infer_target(self, guide=None, visualizer=None, return_energy=False, return_topo=False):
+    def infer_target(self, guide=None, visualizer=None, sample_mult=False, return_topo=False):
         agent_hist_xy = self.agent_history_xy[-1] 
         agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
         if self.policy_tag[:2] == 'dp':
@@ -374,19 +374,22 @@ class UnconditionalMazeTopo(MazeEnv):
         with torch.autocast(device_type="cuda"), seeded_context(0):
             
             obs_i = copy.deepcopy(obs_batch)
-            print(obs_i["observation.state"][0,0,:])
-            actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_perturbed_actions(obs_i, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
-            # # gen_perturb_energies(actions[0])
-            # obs_e = copy.deepcopy(obs_batch)
-            # print(obs_e["observation.state"][0,0,:])
-            # perturbed_trajectory, perturbed_energy, action_e = self.gen_perturb_energies(actions, obs_e)
+                        
+            if sample_mult: 
+                actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_increasingly_perturbed_actions(obs_i, num_inc=3, mag_mul = 0.1, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
+            else: 
+                actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_perturbed_actions(obs_i, mag_mul = 0.6, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
             
             a_out = actions.detach().cpu().numpy()
             e_out = np.squeeze(energy_action.detach().cpu().numpy())
             abl_out = perturbed_trajectory.detach().cpu().numpy()
-            abl_energies = np.squeeze(energy_perturbed.detach().cpu().numpy())
+            abl_energies = np.squeeze(energy_perturbed.detach().cpu().numpy(), axis=-1)
+
+            # all_pert = np.vstack((abl_out1, abl_out2, abl_out3))
+            # energies = np.concatenate((abl_energies1, abl_energies2, abl_energies3))
+        
             # print(a_out.shape, e_out.shape, abl_out.shape, abl_energies.shape)
-            return a_out[0:3, :, :], e_out[0:3], abl_out[0:3, :, :], abl_energies[0:3]
+            return a_out, e_out, abl_out, abl_energies
 
 
     def imshow3d(self, ax, array, value_direction='z', pos=0, norm=None, cmap=None):
@@ -434,12 +437,14 @@ class UnconditionalMazeTopo(MazeEnv):
         # yi = self.gui2y(yi)
         xi = xi - 0.5
         yi = yi - 0.5
-        print(xi)
-        print(yi)
-        print(zi)
+        # print(xi)
+        # print(yi)
+        # print(zi)
         ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.75)
 
-    def plot_energies(self, xy, energies, name=""):
+    def plot_energies(self, xy, energies, num_inc=1, name=""):
+        num_traj = int(len(energies)/(num_inc + 1))
+        
         fig = plt.figure()
         ax = fig.add_subplot(projection='3d')
         maze = np.swapaxes(self.maze, 0, 1)
@@ -448,8 +453,8 @@ class UnconditionalMazeTopo(MazeEnv):
         # X, Y, Z = axes3d.get_test_data(0.05)
         X = xy[:, :, 0]
         Y = xy[:, :, 1]
-        print(X)
-        print(Y)
+        # print(X)
+        # print(Y)
         # energies = np.array([0,0,0,3,3,3])
         energies = einops.rearrange(energies, "n -> 1 n")
         energy_colors = self.generate_energy_color_map(energies)
@@ -461,13 +466,17 @@ class UnconditionalMazeTopo(MazeEnv):
         # print(Z.shape)
         # cmap = plt.get/_cmap('rainbow')
         
+        
+        
+        print("num traj, num inc", num_traj, num_inc)
+        
         colors = mpl.colormaps['tab20'].colors
-        c = np.tile(np.arange(int(xy.shape[0]/2)), 2)
+        c = np.tile(np.arange(int(num_traj)), num_inc + 1)
         print(c)
         C = einops.rearrange(c, "n -> 1 n")
         C = np.repeat(C.T, xy.shape[1], axis=1)
-        print(C)
-        cmap = ListedColormap(["darkorange", "lawngreen", "lightseagreen"]) #"lawngreen", 
+        # print(C)
+        cmap = ListedColormap(["darkorange", "lawngreen", "lightseagreen", "pink"]) #"lawngreen", 
         colors = cmap(c)
         
         # for i in range(int(xy.shape[0])):
@@ -478,7 +487,7 @@ class UnconditionalMazeTopo(MazeEnv):
         # colors = plt.get_cmap(cmap)(norm(C))
         # norm = Normalize()
         # C = norm(C) * 100
-        print(C)
+        # print(C)
 # plot_examples([cmap])
         ax.scatter(X, Y, Z, c=C, cmap=cmap, s=4)
         
@@ -515,6 +524,9 @@ class UnconditionalMazeTopo(MazeEnv):
         while self.running:
             self.update_mouse_pos()
             
+            num_inc = 3
+            num_view = 1
+            
             # Handle events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -523,12 +535,23 @@ class UnconditionalMazeTopo(MazeEnv):
                 if event.type == pygame.KEYDOWN: 
                     # press s to save the trial
                     if event.key == pygame.K_s:
-                        self.plot_energies(xy, energies, name = str(i)) 
+                        self.plot_energies(xy, energies, num_inc=num_inc, name = str(i)) 
 
             self.update_agent_pos(self.mouse_pos.copy())
-            xy_pred, xy_energy, xy_topo, xy_topo_energy = self.infer_target(return_energy=True, return_topo=True)
+            xy_pred, xy_energy, xy_topo, xy_topo_energy = self.infer_target(return_topo=True, sample_mult=True)
             # print(xy_pred.shape, xy_energy.shape)
             # print(xy_topo.shape, xy_topo_energy.shape)
+             
+            i = 3
+            xy_pred = xy_pred[i:i+num_view]
+            xy_energy = xy_energy[i:i+num_view]
+            xy_topo = xy_topo[:, i:i+num_view]
+            xy_topo_energy = xy_topo_energy[:, i:i+num_view]
+            
+            xy_topo = einops.rearrange(xy_topo, "n b t c -> (n b) t c")
+            xy_topo_energy = einops.rearrange(xy_topo_energy, "n b -> (n b)")
+            
+            num_inc = xy_topo.shape[0]
             
             xy = np.vstack((xy_pred, xy_topo))
             energies = np.concatenate((xy_energy, xy_topo_energy))

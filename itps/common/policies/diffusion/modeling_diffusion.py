@@ -23,6 +23,13 @@ from typing import Callable
 
 import einops
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib import cm
+import matplotlib.colors as plt_colors
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+
+
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
@@ -220,6 +227,8 @@ class EBMDiffusionModel(nn.Module):
             
         register_buffer('loss_weight', loss_weight)
         
+        self.i = 0
+        
         if config.num_inference_steps is None:
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
@@ -396,6 +405,92 @@ class EBMDiffusionModel(nn.Module):
         collisions = self.maze[maze_x, maze_y]
         collisions = collisions.reshape(batch_size, num_steps)
         return np.any(collisions, axis=1)
+    
+    def plot_energies(self, base_traj, pert_traj, base_e=None, pert_e=None, name=""):
+        '''
+        For debugging
+        '''
+        maze = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                            [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+                            [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+                            [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+                            [1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1],
+                            [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1],
+                            [1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
+                            [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+                            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]).astype(bool)
+        
+        def imshow3d(ax, array, value_direction='z', pos=0, norm=None, cmap=None):
+            """
+            """
+            if norm is None:
+                norm = plt_colors.Normalize()
+            colors = plt.get_cmap(cmap)(norm(array))
+
+            if value_direction == 'x':
+                nz, ny = array.shape
+                zi, yi = np.mgrid[0:nz + 1, 0:ny + 1]
+                xi = np.full_like(yi, pos)
+            elif value_direction == 'y':
+                nx, nz = array.shape
+                xi, zi = np.mgrid[0:nx + 1, 0:nz + 1]
+                yi = np.full_like(zi, pos)
+            elif value_direction == 'z':
+                ny, nx = array.shape
+                yi, xi = np.mgrid[0:ny + 1, 0:nx + 1]
+                zi = np.full_like(xi, pos)
+            else:
+                raise ValueError(f"Invalid value_direction: {value_direction!r}")
+            xi = xi - 0.5
+            yi = yi - 0.5
+            ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.75)
+
+        np_base = base_traj[0:3, :, :].detach().cpu().numpy()
+        np_pert = pert_traj[0:3, :, :].detach().cpu().numpy()
+        
+        
+        fig = plt.figure()
+        ax = fig.add_subplot(projection='3d')
+        maze = np.swapaxes(maze, 0, 1)
+        
+        imshow3d(ax, maze, cmap="binary")
+        
+        # xy = torch.stack((base_traj[0:3], pert_traj[0:3])).detach().cpu().numpy()
+        xy = np.vstack((np_base, np_pert))
+        # energies = np.array([base_e.item(), pert_e.item()])
+        #  energies = np.concatenate((base_e, pert_e))
+
+        
+        X = xy[:, :, 0]
+        Y = xy[:, :, 1]
+        print("X", X.shape)
+        print("Y", Y.shape)
+        energies = np.array([1,1,1,3,3,3])
+        # energies = np.array([1, 2])
+        energies = einops.rearrange(energies, "n -> 1 n")
+        
+        Z = np.repeat(energies.T, xy.shape[1], axis=1)
+        
+        colors = mpl.colormaps['tab20'].colors
+        c = np.tile(np.arange(int(xy.shape[0]/2)), 2)
+        # print(c)
+        C = einops.rearrange(c, "n -> 1 n")
+        C = np.repeat(C.T, xy.shape[1], axis=1)
+        # print(C)
+        cmap = ListedColormap(["darkorange", "lawngreen", "lightseagreen"]) #"lawngreen", 
+        colors = cmap(c)
+        
+        # for i in range(int(xy.shape[0])):
+        for i, color in enumerate(colors):
+            # color = (energy_colors[i, :3] * 255).astype(int)
+            ax.plot(X[i], Y[i], Z[i], color=color)  # Plot contour curves
+        
+        # print(C)
+        ax.scatter(X, Y, Z, c=C, cmap=cmap, s=4)
+        
+        
+        plt.show()
+        
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
@@ -479,7 +574,11 @@ class EBMDiffusionModel(nn.Module):
             # Curruption Function: construct a set of negative labels
             # xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
-            
+            # two trees adding the same noise to both the positve and negative datapoint
+                # need to make sure that my sample from clean data is matching corresponding  perturbed version
+                # somtimes use slightly pertubed verion as positive datata
+                #  
+
 
             if torch.rand(1) > 0.4: 
                 pert_traj = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps)
@@ -512,6 +611,9 @@ class EBMDiffusionModel(nn.Module):
             t_concat = torch.cat([timesteps, timesteps], dim=0)
             energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
 
+            if self.i % 1000 == 0: 
+                self.plot_energies(data_sample, pert_traj)
+            self.i += 1
 
             # Compute noise contrastive energy loss
             energy_real, energy_fake = torch.chunk(energy, 2, 0)

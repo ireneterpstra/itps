@@ -118,7 +118,7 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
 
         return actions
     
-    def sample_perturbed_actions(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None):
+    def sample_perturbed_actions(self, observation_batch: dict[str, Tensor], mag_mul=0.5 , guide: Tensor | None = None, visualizer=None):
         observation_batch = self.normalize_inputs(observation_batch)
         if guide is not None:
             guide = self.normalize_targets({"action": guide})["action"]
@@ -126,11 +126,32 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
             observation_batch["observation.images"] = torch.stack(
                 [observation_batch[k] for k in self.expected_image_keys], dim=-4
             )
-        actions, energy_action, perturbed_traj, energy_pert = self.diffusion.generate_perturbed_actions(observation_batch, guide=guide, visualizer=visualizer)
+        actions, energy_action, perturbed_traj, energy_pert = self.diffusion.generate_perturbed_actions(observation_batch, mag_mul=mag_mul, guide=guide, visualizer=visualizer)
         
         actions = self.unnormalize_outputs({"action": actions})["action"]
         perturbed_traj = self.unnormalize_outputs({"action": perturbed_traj})["action"]
         
+        return actions, energy_action, perturbed_traj, energy_pert
+    
+    def sample_increasingly_perturbed_actions(self, observation_batch: dict[str, Tensor], num_inc=1, mag_mul=0.1, guide: Tensor | None = None, visualizer=None):
+        observation_batch = self.normalize_inputs(observation_batch)
+        if guide is not None:
+            guide = self.normalize_targets({"action": guide})["action"]
+        if len(self.expected_image_keys) > 0:
+            observation_batch["observation.images"] = torch.stack(
+                [observation_batch[k] for k in self.expected_image_keys], dim=-4
+            )
+        actions, energy_action, perturbed_traj, energy_pert = self.diffusion.generate_increasingly_perturbed_actions(observation_batch, num_inc=num_inc, mag_mul=mag_mul, guide=guide, visualizer=visualizer)
+        
+        def u_norm(act):
+            return self.unnormalize_outputs({"action": act})["action"]
+        
+        actions = u_norm(actions)
+        
+        perturbed_traj = torch.stack([
+            u_norm(x_i) for x_i in torch.unbind(perturbed_traj, dim=0)
+        ], dim=0)
+
         return actions, energy_action, perturbed_traj, energy_pert
     
     def get_energy(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
@@ -393,7 +414,7 @@ class EBMDiffusionModel(nn.Module):
         return actions 
     
     
-    def generate_perturbed_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None) -> Tensor:
+    def generate_perturbed_actions(self, batch: dict[str, Tensor], mag_mul = 0.6, guide: Tensor | None = None, visualizer=None, normalizer=None) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -415,7 +436,7 @@ class EBMDiffusionModel(nn.Module):
         actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
 
          
-        perturbed_traj = self.perturb_trajectory(actions)
+        perturbed_traj = self.perturb_trajectory(actions, mag_mul=mag_mul)
         
         timesteps = torch.full(actions.shape[:1], 0, dtype=torch.long, device=actions.device)
         global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
@@ -436,64 +457,129 @@ class EBMDiffusionModel(nn.Module):
         return actions, energy_action, perturbed_traj, energy_pert # does cutting off the end make the energy calc wrong?
         
         # return actions 
-    
-    def perturb_trajectory(self, base_trajectory: Tensor) -> Tensor:
+
+    def generate_increasingly_perturbed_actions(self, batch: dict[str, Tensor], num_inc, mag_mul, guide: Tensor | None = None, visualizer=None, normalizer=None) -> Tensor:
         """
-        This function expects `base_trajectory` to be a batch of trajectories:
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+        }
+        """
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps, f"{n_obs_steps=} {self.config.n_obs_steps=}"
+
+        # print("observation_batch get", batch)
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        # run sampling
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
+
         
+        perturbed_r = self.perturb_trajectory(actions, num_inc=num_inc, mag_mul=mag_mul)
+        # for i in range(num_inc): 
+            
+        # perturbed_traj = perturbed_r.clone()[i]
+        timesteps = torch.full(actions.shape[:1], 0, dtype=torch.long, device=actions.device)
+        # global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+        global_cond_concat = global_cond.repeat_interleave(1 + num_inc, dim=0)
+        traj_concat = torch.cat([actions, perturbed_r], dim=0)
+        # t_concat = torch.cat([timesteps, timesteps], dim=0)
+        t_concat = timesteps.repeat_interleave( 1 + num_inc, dim=0)
+        
+        energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+
+        # energies = torch.chunk(energy, 1 + num_inc, 0)
+        energies = einops.rearrange(energy, "(n b) 1 -> n b 1", n = num_inc + 1)
+        
+        start = n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        actions = actions[:, start:end]
+        perturbed_r = perturbed_r[:, start:end]
+        
+        perturbed_r = einops.rearrange(perturbed_r, "(n b) t c -> n b t c", n = num_inc)
+
+        
+        return actions, energies[:1], perturbed_r, energies[1:]
+            
+    def perturb_trajectory(self, base_trajectory: Tensor, num_inc, mag_mul=0.4) -> Tensor:
         """
-        # make a variation where you have mutiple perts
-        # print(base_trajectory.shape)
+        This function expects `base_trajectory` to be a batch of trajectories: (B, T, 2)
+        
+        num_ic (N)
+        
+        out:
+            perturbed (B*N T 2)
+        """
+        
+        # Multiple magnitudes of same pert
+        perturbed_r = base_trajectory.clone().unsqueeze(0)
+        perturbed_r = perturbed_r.repeat_interleave(num_inc, dim=0)  # (N B T 2)
         
         num_traj = base_trajectory.shape[0]
         traj_len = base_trajectory.shape[1]
-        # print("traj_len", traj_len)
                 
+        # Calc loc of perturbs 1 per base traj (B)
         impulse_start = (traj_len-2) * torch.rand(num_traj).to(base_trajectory.device) # np.random.randint(0, traj_len-2) 
         impulse_end = torch.mul((traj_len-1 - impulse_start+1), torch.rand(num_traj).to(base_trajectory.device)) + impulse_start+1 # np.random.randint(impulse_start+1, traj_len-1)
-        impulse_start = einops.rearrange(impulse_start, "n -> n 1")
-        impulse_end = einops.rearrange(impulse_end, "n -> n 1")
+        impulse_start = einops.rearrange(impulse_start, "n -> n 1") # (B, 1)
+        impulse_end = einops.rearrange(impulse_end, "n -> n 1") # (B, 1)
         impulse_mean = (impulse_start + impulse_end)/2
-        # self.gui_size = (1200, 900)
-        # print("impulse start, end", impulse_start[0], impulse_end[0])
         center_index = torch.round(impulse_mean).squeeze()
-        impulse_center_x = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 0]
-        impulse_center_y = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 1]
-        impulse_target_x = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_x - 1 # np.random.uniform(-2, 2, size=(num_traj,)) # -8, 8
-        impulse_target_x = einops.rearrange(impulse_target_x, "n -> n 1")
-        impulse_target_y = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_y - 1 # np.random.uniform(-8, 8, size=(num_traj,)) # -8, 8
-        impulse_target_y = einops.rearrange(impulse_target_y, "n -> n 1")
+        impulse_center_x = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 0] # (B, 1)?
+        impulse_center_y = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 1] # (B, 1)?
+           
+           
+        # Want traj to have pert significant enough to matter so all mags are between [-1.5,-0.5] and [0.5,1.5]
+        # Randomly decide array of -0.5 or 0.25
+        
+        mag = (torch.randint(0, 2, (num_traj,2))).to(base_trajectory.device) # (B, 2)
+        mag = torch.where(mag == 0, torch.tensor(-1), torch.tensor(1)).to(base_trajectory.device) # (B, 2)
+        
+        # Generate impulse smoothing kernel
         max_relative_dist = 1 # np.exp(-5) ~= 0.006
-        # print("impulse target 1", impulse_target_x[0], impulse_target_y[0])
-        
-        
         kernel = torch.exp(-max_relative_dist*(torch.Tensor(range(traj_len)).to(base_trajectory.device).view(1, -1) 
-                                               - impulse_mean)**2 / ((impulse_start-impulse_mean)**2))
-        # print(kernel)
-        perturbed = base_trajectory.clone()
-        perturbed[:, :, 1] += (impulse_target_y-perturbed[:, :, 1])*kernel
-        perturbed[:, :, 0] += (impulse_target_x-perturbed[:, :, 0])*kernel
+                                            - impulse_mean)**2 / ((impulse_start-impulse_mean)**2))
         
-        return perturbed
+        print("mag_mul", mag_mul)
+        impulse_target_x = torch.randn(num_traj).to(base_trajectory.device) * 0.1 + mag[:,0] * 0.2
+        impulse_target_y = torch.randn(num_traj).to(base_trajectory.device) * 0.1 + mag[:,1] * 0.2
+        
+        print("impulse_target_xy", impulse_target_x[0].item(), impulse_target_y[0].item())
+            
+        # N amount of diff magnitudes
+        for i in range(num_inc):
+            impulse_target_x_i = impulse_target_x.clone() * (0.5 + i * 0.25) + impulse_center_x
+            impulse_target_y_i = impulse_target_y.clone() * (0.5 + i * 0.25) + impulse_center_y
+            
+            
+            
+            impulse_target_x_r = einops.rearrange(impulse_target_x_i, "n -> n 1")
+            impulse_target_y_r = einops.rearrange(impulse_target_y_i, "n -> n 1")
+            
+            
+            # print(kernel)
+            perturbed = base_trajectory.clone()
+            perturbed[:, :, 1] += (impulse_target_y_r-perturbed[:, :, 1])*kernel
+            perturbed[:, :, 0] += (impulse_target_x_r-perturbed[:, :, 0])*kernel
+            
+            perturbed_r[i, :, :, :] = perturbed
+            
+        perturbed_r = einops.rearrange(perturbed_r, "n b t c -> (n b) t c")
+        
+        return perturbed_r
     
     def get_energy_from_traj(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
         x_traj = torch.cat((trajectories, trajectories[:, -1:, :]), 1)
-        # timesteps = torch.randint(
-        #     low=0,
-        #     high=self.noise_scheduler.config.num_train_timesteps,
-        #     size=(traj.shape[0],), 
-        #     device = device
-        # ).long()
         
-        # t = self.config.num_inference_steps
         t = self.noise_scheduler.timesteps
-        # print(t) # why is it 0 at the end? 
         timesteps = torch.full((x_traj.shape[0],), 0, dtype=torch.long, device=x_traj.device)
-        # print(timesteps)
         global_cond = self._prepare_global_conditioning(observation_batch)
         
-        # print("global_cond traj", global_cond)
-        # print("observation_batch traj", observation_batch)
         energies = self.model(x_traj, timesteps, global_cond=global_cond, return_energy=True)
         
         return energies
@@ -615,15 +701,15 @@ class EBMDiffusionModel(nn.Module):
             xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
             ##### how neccesary is this?? retrain w/o this
-            xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0) # play around with step number
-            xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
-            loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+            # xmin_noise = self.opt_step(xmin_noise, timesteps, global_cond=global_cond, step=2, sf=1.0) # play around with step number
+            # xmin = extract(self.sqrt_alphas_cumprod.to(xmin_noise.device), timesteps, trajectory.shape) * trajectory
+            # loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
             
-            xmin_noise = xmin_noise.detach()
-            xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
-            xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
+            # xmin_noise = xmin_noise.detach()
+            # xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, timesteps, torch.zeros_like(xmin_noise))
+            # xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
             
-            xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
+            # xmin_noise = self.noise_scheduler.add_noise(xmin_noise_rescale, eps, timesteps)
             #####
             
             
