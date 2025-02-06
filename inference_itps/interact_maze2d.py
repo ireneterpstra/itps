@@ -127,6 +127,18 @@ class MazeEnv:
         collisions = collisions.reshape(batch_size, num_steps)
         return np.any(collisions, axis=1)
     
+    def check_collision_i(self, xy_traj):
+        assert xy_traj.shape[2] == 2, "Input must be a 2D array of (x, y) coordinates."
+        batch_size, num_steps, _ = xy_traj.shape
+        xy_traj = xy_traj.reshape(-1, 2)
+        xy_traj = np.clip(xy_traj, [0, 0], [self.maze.shape[0] - 1, self.maze.shape[1] - 1])
+        maze_x = np.round(xy_traj[:, 0]).astype(int)
+        maze_y = np.round(xy_traj[:, 1]).astype(int)
+        collisions = self.maze[maze_x, maze_y]
+        collisions = collisions.reshape(batch_size, num_steps)
+        # print(collisions)
+        return collisions, np.any(collisions, axis=1)
+    
     def find_first_collision_from_GUI(self, gui_traj):
         assert gui_traj.shape[1] == 2, "Input must be a 2D array"
         xy_traj = np.array([self.gui2xy(point) for point in gui_traj])
@@ -327,6 +339,8 @@ class UnconditionalMazeTopo(MazeEnv):
         self.draw_maze_background()
         if xy_pred is not None:
             energy_colors = self.generate_energy_color_map(energies)
+            cmap = ListedColormap(["darkorange", "lightseagreen", "lawngreen", "pink"]) #"lawngreen", 
+            colors = cmap(c)
             if collisions is None:
                 collisions = self.check_collision(xy_pred)
             # self.report_collision_percentage(collisions)
@@ -351,7 +365,7 @@ class UnconditionalMazeTopo(MazeEnv):
   
         pygame.display.flip()
 
-    def infer_target(self, guide=None, visualizer=None, sample_mult=False, return_topo=False):
+    def infer_target(self, guide=None, visualizer=None, num_inc=1, return_topo=False):
         agent_hist_xy = self.agent_history_xy[-1] 
         agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
         if self.policy_tag[:2] == 'dp':
@@ -375,8 +389,8 @@ class UnconditionalMazeTopo(MazeEnv):
             
             obs_i = copy.deepcopy(obs_batch)
                         
-            if sample_mult: 
-                actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_increasingly_perturbed_actions(obs_i, num_inc=3, mag_mul = 0.1, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
+            if num_inc > 1: 
+                actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_increasingly_perturbed_actions(obs_i, num_inc=2, mag_mul = 0.2, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
             else: 
                 actions, energy_action, perturbed_trajectory, energy_perturbed = self.policy.sample_perturbed_actions(obs_i, mag_mul = 0.6, guide=guide, visualizer=visualizer) # directly call the policy in order to visualize the intermediate steps
             
@@ -440,11 +454,16 @@ class UnconditionalMazeTopo(MazeEnv):
         # print(xi)
         # print(yi)
         # print(zi)
-        ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.75)
+        ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.5)
 
-    def plot_energies(self, xy, energies, num_inc=1, name=""):
+    def plot_energies(self, xy, energies, num_inc=1, collisions=None, name=""):
         num_traj = int(len(energies)/(num_inc + 1))
-        
+        if collisions is None:
+            collisions, traj_collisions = self.check_collision_i(xy)
+        print(collisions)
+        print(collisions.shape, xy.shape)
+        print(traj_collisions)
+        print(xy[collisions].shape, xy[collisions])
         fig = plt.figure()
         ax = fig.add_subplot(projection='3d')
         maze = np.swapaxes(self.maze, 0, 1)
@@ -457,7 +476,7 @@ class UnconditionalMazeTopo(MazeEnv):
         # print(Y)
         # energies = np.array([0,0,0,3,3,3])
         energies = einops.rearrange(energies, "n -> 1 n")
-        energy_colors = self.generate_energy_color_map(energies)
+        # energy_colors = self.generate_energy_color_map(energies)
         
         Z = np.repeat(energies.T, xy.shape[1], axis=1)
         # print(energies)
@@ -476,20 +495,29 @@ class UnconditionalMazeTopo(MazeEnv):
         C = einops.rearrange(c, "n -> 1 n")
         C = np.repeat(C.T, xy.shape[1], axis=1)
         # print(C)
-        cmap = ListedColormap(["darkorange", "lawngreen", "lightseagreen", "pink"]) #"lawngreen", 
+        cmap = ListedColormap(["darkorange", "lightseagreen", "lawngreen", "pink"]) #"lawngreen", 
         colors = cmap(c)
+        
+        # Xy = X[~collisions]
+        # Yy = Y[~collisions]
+        # Zy = Z[~collisions]
+        # Cy = C[~collisions]
+        # ax.scatter(Xy, Yy, Zy, c=Cy, cmap=cmap, s=4)
+        Xn = X[collisions]
+        Yn = Y[collisions]
+        Zn = Z[collisions]
         
         # for i in range(int(xy.shape[0])):
         for i, color in enumerate(colors):
+            print("color", color)
             # color = (energy_colors[i, :3] * 255).astype(int)
             ax.plot(X[i], Y[i], Z[i], color=color)  # Plot contour curves
+            Xyi = X[i][~collisions[i]]
+            Yyi = Y[i][~collisions[i]]
+            Zyi = Z[i][~collisions[i]]
+            ax.scatter(Xyi, Yyi, Zyi, c=color, s=5)
         
-        # colors = plt.get_cmap(cmap)(norm(C))
-        # norm = Normalize()
-        # C = norm(C) * 100
-        # print(C)
-# plot_examples([cmap])
-        ax.scatter(X, Y, Z, c=C, cmap=cmap, s=4)
+        ax.scatter(Xn, Yn, Zn, c='red', s=8, marker="X")
         
         #colors = plt.get_cmap(cmap)(self.maze)
         
@@ -520,12 +548,12 @@ class UnconditionalMazeTopo(MazeEnv):
     
 
     def run(self):
-        i = 0
+        # i = 0s
         while self.running:
             self.update_mouse_pos()
             
-            num_inc = 3
-            num_view = 1
+            num_inc = 2
+            num_view = 3
             
             # Handle events
             for event in pygame.event.get():
@@ -538,11 +566,11 @@ class UnconditionalMazeTopo(MazeEnv):
                         self.plot_energies(xy, energies, num_inc=num_inc, name = str(i)) 
 
             self.update_agent_pos(self.mouse_pos.copy())
-            xy_pred, xy_energy, xy_topo, xy_topo_energy = self.infer_target(return_topo=True, sample_mult=True)
+            xy_pred, xy_energy, xy_topo, xy_topo_energy = self.infer_target(return_topo=True, num_inc=num_inc)
             # print(xy_pred.shape, xy_energy.shape)
             # print(xy_topo.shape, xy_topo_energy.shape)
              
-            i = 3
+            i = 0
             xy_pred = xy_pred[i:i+num_view]
             xy_energy = xy_energy[i:i+num_view]
             xy_topo = xy_topo[:, i:i+num_view]
@@ -563,7 +591,7 @@ class UnconditionalMazeTopo(MazeEnv):
             #     self.plot_energies(xy, energies)
             
             self.clock.tick(30)
-            i += 1
+            # i += 1
 
         pygame.quit()
 

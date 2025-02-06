@@ -374,9 +374,9 @@ class EBMDiffusionModel(nn.Module):
         center_index = torch.round(impulse_mean).squeeze()
         impulse_center_x = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 0]
         impulse_center_y = base_trajectory[torch.arange(num_traj), center_index.to(torch.int), 1]
-        impulse_target_x = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_x - 1 # np.random.uniform(-2, 2, size=(num_traj,)) # -8, 8
+        impulse_target_x = 0.2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_x - 0.1 # np.random.uniform(-2, 2, size=(num_traj,)) # -8, 8
         impulse_target_x = einops.rearrange(impulse_target_x, "n -> n 1")
-        impulse_target_y = 2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_y - 1 # np.random.uniform(-8, 8, size=(num_traj,)) # -8, 8
+        impulse_target_y = 0.2 * torch.rand(num_traj).to(base_trajectory.device) + impulse_center_y - 0.1 # np.random.uniform(-8, 8, size=(num_traj,)) # -8, 8
         impulse_target_y = einops.rearrange(impulse_target_y, "n -> n 1")
         max_relative_dist = 1 # np.exp(-5) ~= 0.006
         # print("impulse target 1", impulse_target_x[0], impulse_target_y[0])
@@ -453,7 +453,7 @@ class EBMDiffusionModel(nn.Module):
         ax = fig.add_subplot(projection='3d')
         maze = np.swapaxes(maze, 0, 1)
         
-        imshow3d(ax, maze, cmap="binary")
+        # imshow3d(ax, maze, cmap="binary")
         
         # xy = torch.stack((base_traj[0:3], pert_traj[0:3])).detach().cpu().numpy()
         xy = np.vstack((np_base, np_pert))
@@ -465,7 +465,7 @@ class EBMDiffusionModel(nn.Module):
         Y = xy[:, :, 1]
         print("X", X.shape)
         print("Y", Y.shape)
-        energies = np.array([1,1,1,3,3,3])
+        energies = np.array([1,1,1,1,1,1])
         # energies = np.array([1, 2])
         energies = einops.rearrange(energies, "n -> 1 n")
         
@@ -580,12 +580,16 @@ class EBMDiffusionModel(nn.Module):
                 #  
 
 
-            if torch.rand(1) > 0.4: 
-                pert_traj = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps)
-            else: 
-                pret_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-                pert_traj = self.perturb_trajectory(pret_sample)
-            
+            # if torch.rand(1) > 0.4: 
+            #     pert_traj = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps)
+            # else: 
+            pert_traj = self.perturb_trajectory(trajectory)
+            pret_sample = self.noise_scheduler.add_noise(pert_traj, eps, timesteps)
+                
+            if self.i % 2 == 0: 
+                self.plot_energies(trajectory, pert_traj)
+                self.plot_energies(data_sample, pret_sample)
+            self.i += 1
 
             # check collisions
             # TODO: non collision paths should be re sampled or labled as good? 
@@ -606,14 +610,12 @@ class EBMDiffusionModel(nn.Module):
             
             # Compute energy of both distributions
             global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
-            traj_concat = torch.cat([data_sample, pert_traj], dim=0)
+            traj_concat = torch.cat([data_sample, pret_sample], dim=0)
             # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
             t_concat = torch.cat([timesteps, timesteps], dim=0)
             energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
 
-            if self.i % 1000 == 0: 
-                self.plot_energies(data_sample, pert_traj)
-            self.i += 1
+            
 
             # Compute noise contrastive energy loss
             energy_real, energy_fake = torch.chunk(energy, 2, 0)

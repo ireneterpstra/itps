@@ -537,6 +537,7 @@ class EBMDiffusionModel(nn.Module):
         # Want traj to have pert significant enough to matter so all mags are between [-1.5,-0.5] and [0.5,1.5]
         # Randomly decide array of -0.5 or 0.25
         
+        # do I care about this? 
         mag = (torch.randint(0, 2, (num_traj,2))).to(base_trajectory.device) # (B, 2)
         mag = torch.where(mag == 0, torch.tensor(-1), torch.tensor(1)).to(base_trajectory.device) # (B, 2)
         
@@ -545,16 +546,16 @@ class EBMDiffusionModel(nn.Module):
         kernel = torch.exp(-max_relative_dist*(torch.Tensor(range(traj_len)).to(base_trajectory.device).view(1, -1) 
                                             - impulse_mean)**2 / ((impulse_start-impulse_mean)**2))
         
-        print("mag_mul", mag_mul)
+        # print("mag_mul", mag_mul)
         impulse_target_x = torch.randn(num_traj).to(base_trajectory.device) * 0.1 + mag[:,0] * 0.2
         impulse_target_y = torch.randn(num_traj).to(base_trajectory.device) * 0.1 + mag[:,1] * 0.2
         
-        print("impulse_target_xy", impulse_target_x[0].item(), impulse_target_y[0].item())
+        # print("impulse_target_xy", impulses_target_x[0].item(), impulse_target_y[0].item())
             
         # N amount of diff magnitudes
         for i in range(num_inc):
-            impulse_target_x_i = impulse_target_x.clone() * (0.5 + i * 0.25) + impulse_center_x
-            impulse_target_y_i = impulse_target_y.clone() * (0.5 + i * 0.25) + impulse_center_y
+            impulse_target_x_i = impulse_target_x.clone() * (0.5 + i * 0.4) + impulse_center_x
+            impulse_target_y_i = impulse_target_y.clone() * (0.5 + i * 0.4) + impulse_center_y
             
             
             
