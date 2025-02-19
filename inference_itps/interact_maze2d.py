@@ -247,6 +247,172 @@ class MazeEnv:
         return samples, scores
     
     
+class CollisionMapper(MazeEnv):
+    def __init__(self, policy, policy_tag=None):
+        super().__init__()
+        self.mouse_pos = None
+        self.agent_in_collision = False
+        self.agent_history_xy = []
+        self.policy = policy
+        self.policy_tag = policy_tag
+        self.coll_perc_hist = dict()
+        
+    def infer_target(self, xy = None, guide=None, visualizer=None):
+        if xy is None: 
+            agent_hist_xy = self.agent_history_xy[-1] 
+            # print("agent xy", agent_hist_xy)
+        else: 
+            agent_hist_xy = xy
+            
+        agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
+        if self.policy_tag[:2] == 'dp':
+            agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
+            
+    
+
+        obs_batch = {
+            "observation.state": einops.repeat(
+                torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+            )
+        }
+        obs_batch["observation.environment_state"] = einops.repeat(
+            torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+        )
+        
+        if guide is not None:
+            guide = torch.from_numpy(guide).float().cuda()
+
+        with torch.autocast(device_type="cuda"), seeded_context(0):
+            if self.policy_tag == 'act':
+                actions = self.policy.run_inference(obs_batch).cpu().numpy()
+            else:
+                actions = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer).cpu().numpy() # directly call the policy in order to visualize the intermediate steps
+        return actions
+    
+    def generate_coll_color_map(self, num_steps):
+        cmap = plt.get_cmap('viridis')
+        values = np.linspace(0, 1, num_steps)
+        colors = cmap(values)
+        return colors
+    
+    def update_coll_screen(self, xy_pred=None, collisions=None, scores=None, keep_drawing=False, traj_in_gui_space=False):
+        self.draw_maze_background()
+        
+        coll_colors = self.generate_coll_color_map(101)
+        for x in range(0, self.gui_size[0], 10):
+            for y in range(0, self.gui_size[1], 10):
+                
+                gui_xy = tuple([x,y])
+                xy = self.gui2xy(gui_xy)
+                maze_x = np.round(xy[0]).astype(int)
+                maze_y = np.round(xy[1]).astype(int)
+                collision = self.maze[maze_x, maze_y]
+                if collision: 
+                    coll_perc = 100
+                else: 
+                    xy_pred = self.infer_target(xy)
+                    collisions = self.check_collision(xy_pred)
+                    coll_perc = self.report_collision_percentage(collisions)
+                # int_pos = tuple(xy)
+                self.coll_perc_hist[gui_xy] = coll_perc
+                
+                if y % 100 == 0: 
+                    self.draw_maze_background()
+                    for pos_i, col_perc_i in self.coll_perc_hist.items():
+                        # print("pos, coll_perc", pos_i, col_perc_i)
+                        color = (coll_colors[int(100-col_perc_i), :3] * 255).astype(int)  
+                        pygame.draw.circle(self.screen, color, pos_i, 5)
+                    pygame.display.flip()
+                    
+            print("x pos", x)
+            
+        for pos_i, col_perc_i in self.coll_perc_hist.items():
+        # print("pos, coll_perc", pos_i, col_perc_i)
+            color = (coll_colors[int(col_perc_i), :3] * 255).astype(int)  
+            pygame.draw.circle(self.screen, color, pos_i, 5)
+                    
+                    
+        # if xy_pred is not None:
+        #     time_colors = self.generate_time_color_map(xy_pred.shape[1])
+            
+        #     if collisions is None:
+        #         collisions = self.check_collision(xy_pred)
+            
+
+        #     coll_perc = self.report_collision_percentage(collisions)
+        #     int_pos = tuple((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])))
+        #     print("int_pos", int_pos)
+        #     self.coll_perc_hist[int_pos] = coll_perc
+            
+            
+                
+                
+        #     # for idx, pred in enumerate(xy_pred):
+        #     #     for step_idx in range(len(pred) - 1):
+        #     #         color = (time_colors[step_idx, :3] * 255).astype(int)
+                    
+        #     #         # visualize constraint violations (collisions) by tinting trajectories white
+        #     #         whiteness_factor = 0.8 if collisions[idx] else 0.0 
+        #     #         color = self.blend_with_white(color, whiteness_factor)
+        #     #         if scores is None: 
+        #     #             circle_size = 5 if collisions[idx] else 5
+        #     #         else: # when similarity scores are provided, visualizing them by changing the trajectory size
+        #     #             circle_size = int(3 + 20 * scores[idx])
+        #     #         if traj_in_gui_space:
+        #     #             start_pos = pred[step_idx]
+        #     #             end_pos = pred[step_idx + 1]
+        #     #         else:
+        #     #             start_pos = self.xy2gui(pred[step_idx])
+        #     #             end_pos = self.xy2gui(pred[step_idx + 1])
+        #     #         pygame.draw.circle(self.screen, color, start_pos, circle_size)
+
+        # pygame.draw.circle(self.screen, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 20)
+        # if keep_drawing: # visualize the human drawing input
+        #     for i in range(len(self.draw_traj) - 1):
+        #         pygame.draw.line(self.screen, self.GRAY, self.draw_traj[i], self.draw_traj[i + 1], 10)
+
+  
+        pygame.display.flip()
+    
+    def update_mouse_pos(self):
+        self.mouse_pos = np.array(pygame.mouse.get_pos())
+
+    def update_agent_pos(self, new_agent_pos, history_len=1):
+        self.agent_gui_pos = np.array(new_agent_pos)
+        agent_xy_pos = self.gui2xy(self.agent_gui_pos)
+        self.agent_in_collision = self.check_collision(agent_xy_pos.reshape(1, 1, 2))[0]
+        if self.agent_in_collision:
+            self.agent_color = self.blend_with_white(self.RED, 0.8)
+        else:
+            self.agent_color = self.RED        
+        self.agent_history_xy.append(agent_xy_pos)
+        self.agent_history_xy = self.agent_history_xy[-history_len:]
+
+    def run(self):
+        
+        while self.running:
+            self.update_mouse_pos()
+            
+            # Handle events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    break
+                
+            
+                    
+
+            self.update_agent_pos(self.mouse_pos.copy())
+            xy_pred = self.infer_target()
+            
+            
+            self.update_coll_screen(xy_pred)
+            
+            self.clock.tick(30)
+
+        pygame.quit()
+    
+    
 class UnconditionalMazeTopo(MazeEnv):
     # for dragging the agent around to explore motion manifold with energy topo
     def __init__(self, policy, policy_tag=None):
@@ -489,7 +655,7 @@ class UnconditionalMazeTopo(MazeEnv):
         
         print("num traj, num inc", num_traj, num_inc)
         
-        colors = mpl.colormaps['tab20'].colors
+        # colors = mpl.colormaps['tab20'].colors
         c = np.tile(np.arange(int(num_traj)), num_inc + 1)
         print(c)
         C = einops.rearrange(c, "n -> 1 n")
@@ -850,6 +1016,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', "--checkpoint", type=str, help="Path to the checkpoint")
     parser.add_argument('-p', '--policy', required=True, type=str, help="Policy name")
+    parser.add_argument('-cm', '--collision', action='store_true', help="Collision Mapper")
     parser.add_argument('-u', '--unconditional', action='store_true', help="Unconditional Maze")
     parser.add_argument('-ut', '--topo', action='store_true', help="Unconditional Topo Maze")
     parser.add_argument('-op', '--output-perturb', action='store_true', help="Output perturbation")
@@ -921,8 +1088,10 @@ if __name__ == "__main__":
     else:
         policy = None
         policy_tag = None
-
-    if args.topo and policy_tag in ["dp_ebm"]:
+        
+    if args.collision: 
+        interactiveMaze = CollisionMapper(policy, policy_tag=policy_tag)
+    elif args.topo and policy_tag in ["dp_ebm"]:
         interactiveMaze = UnconditionalMazeTopo(policy, policy_tag=policy_tag)
     elif args.unconditional: 
         interactiveMaze = UnconditionalMaze(policy, policy_tag=policy_tag)

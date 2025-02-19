@@ -41,6 +41,7 @@ from itps.common.logger import Logger, log_output_dir
 from itps.common.policies.factory import make_policy
 from itps.common.policies.policy_protocol import PolicyWithUpdate
 from itps.common.policies.utils import get_device_from_parameters
+from itps.common.utils.pert_utils import perturb_batch
 from itps.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -431,14 +432,18 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         dataloading_s = time.perf_counter() - start_time
         
         # I can add a pert to a batch here but its not technically pre-making
-        print(batch['action'].shape)
+        # print(batch['action'].shape)
         
-        for key in batch:
-            batch[key] = batch[key].to(device, non_blocking=True)
+        trajectory = batch["action"]
+        
+        batch_p = perturb_batch(batch)
+        
+        for key in batch_p:
+            batch_p[key] = batch_p[key].to(device, non_blocking=True)
 
         train_info = update_policy(
             policy,
-            batch,
+            batch_p,
             optimizer,
             cfg.training.grad_clip_norm,
             grad_scaler=grad_scaler,
