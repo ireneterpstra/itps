@@ -506,7 +506,7 @@ class UnconditionalMazeTopo(MazeEnv):
         if xy_pred is not None:
             energy_colors = self.generate_energy_color_map(energies)
             cmap = ListedColormap(["darkorange", "lightseagreen", "lawngreen", "pink"]) #"lawngreen", 
-            colors = cmap(c)
+            # colors = cmap(c)
             if collisions is None:
                 collisions = self.check_collision(xy_pred)
             # self.report_collision_percentage(collisions)
@@ -1055,6 +1055,12 @@ if __name__ == "__main__":
         checkpoint_path = 'weights_maze2d_dp_ebm_pert_100k'
     elif args.policy in ["dp_ebm_hp"]:
         checkpoint_path = 'weights_maze2d_dp_ebm_half_pert_100k'
+    elif args.policy in ["dp_ebm_c"]:
+        checkpoint_path = 'weights_maze2d_conf_coll_100k'
+    elif args.policy in ["dp_ebm_c1"]:
+        checkpoint_path = 'weights_maze2d_conf_coll_0.1_100k'
+    elif args.policy in ["dp_ebm_c3"]:
+        checkpoint_path = 'weights_maze2d_conf_coll_0.3_100k'
     elif args.policy in ["act"]:
         checkpoint_path = 'weights_act'
     else:
@@ -1072,7 +1078,7 @@ if __name__ == "__main__":
         policy_tag = 'dp'
         policy.cuda()
         policy.eval()
-    elif args.policy in ["dp_ebm", "dp_ebm_n", "dp_ebm_p", "dp_ebm_hp"]:
+    elif args.policy in ["dp_ebm", "dp_ebm_n", "dp_ebm_p", "dp_ebm_hp", "dp_ebm_c", "dp_ebm_c1", "dp_ebm_c3"]:
         policy = DiffusionPolicy.from_pretrained(pretrained_policy_path, alignment_strategy=alignment_strategy)
         policy.config.noise_scheduler_type = "DDIM"
         policy.diffusion.num_inference_steps = 10

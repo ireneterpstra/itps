@@ -650,7 +650,7 @@ class EBMDiffusionModel(nn.Module):
             loss_cf = F.cross_entropy(energy_stack_cf, target.long(), reduction='none')[:, None]
 
             loss_scale = 0.5
-            non_coll_loss_scale = 0.1
+            non_coll_loss_scale = 0
             
             loss = loss_mse + loss_scale * loss_energy + non_coll_loss_scale * loss_cf
 
