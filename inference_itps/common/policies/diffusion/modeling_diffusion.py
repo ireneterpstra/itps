@@ -98,7 +98,7 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
         return set(self.config.input_shapes)
 
     @torch.no_grad
-    def run_inference(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, return_energy=False) -> Tensor:
+    def run_inference(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, return_energy=False, high_energy_guide=False) -> Tensor:
         observation_batch = self.normalize_inputs(observation_batch)
         if guide is not None:
             guide = self.normalize_targets({"action": guide})["action"]
@@ -107,9 +107,9 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
                 [observation_batch[k] for k in self.expected_image_keys], dim=-4
             )
         if return_energy: 
-            actions, energy = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self, return_energy=return_energy)
+            actions, energy = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self, return_energy=return_energy, high_energy_guide=high_energy_guide)
         else: 
-            actions = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self)
+            actions = self.diffusion.generate_actions(observation_batch, guide=guide, visualizer=visualizer, normalizer=self, high_energy_guide=high_energy_guide)
 
         actions = self.unnormalize_outputs({"action": actions})["action"]
         
@@ -248,7 +248,7 @@ class EBMDiffusionModel(nn.Module):
 
     # ========= inference  ============
     def conditional_sample(
-        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, guide: Tensor | None = None, visualizer=None, normalizer=None
+        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, guide: Tensor | None = None, visualizer=None, normalizer=None, high_energy_guide=False, 
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -302,13 +302,24 @@ class EBMDiffusionModel(nn.Module):
 
                 # add interaction gradient
                 if guide is not None and t > final_influence_step:
-                    grad = self.guide_gradient(sample, guide)
-                    if self.alignment_strategy == 'guided-diffusion':
-                        guide_ratio = 20 
-                    elif self.alignment_strategy == 'stochastic-sampling':
-                        guide_ratio = 60 
-                    else:
-                        guide_ratio = 0
+                    print("energy guide", high_energy_guide)
+                    if high_energy_guide: 
+                        if self.alignment_strategy == 'guided-diffusion':
+                            guide_ratio = 10
+                        elif self.alignment_strategy == 'stochastic-sampling':
+                            guide_ratio = 40
+                        else:
+                            guide_ratio = 0
+                        
+                        grad = self.guide_with_energy_input(sample, guide)
+                    else: 
+                        grad = self.guide_gradient(sample, guide)
+                        if self.alignment_strategy == 'guided-diffusion':
+                            guide_ratio = 20 
+                        elif self.alignment_strategy == 'stochastic-sampling':
+                            guide_ratio = 60 
+                        else:
+                            guide_ratio = 0
                     model_output = model_output + guide_ratio * grad
                 else:
                     pass
@@ -331,7 +342,33 @@ class EBMDiffusionModel(nn.Module):
         return sample
     
     
+    def guide_with_energy_input(self, naction, guide):
+        """
+        Goal: Energy input as user preferece 
+        If you want to create an obstacle you add high energy input
+        If you want to create a goal you add low energy input 
+        
+        
+        """
+        # naction: (B, pred_horizon, action_dim);
+        # guide: (guide_horizon, action_dim)
+        # print('noisy action shape:', naction.shape, 'guide shape:', guide.shape)
+        # print('mean and std of naction', naction.mean(), naction.std())
+        # print('mean and std of guide', guide.mean(), guide.std())
 
+        assert naction.shape[2] == 2 and guide.shape[1] == 2
+        indices = torch.linspace(0, guide.shape[0]-1, naction.shape[1], dtype=int)
+        guide = torch.unsqueeze(guide[indices], dim=0) # (1, pred_horizon, action_dim)
+        assert guide.shape == (1, naction.shape[1], naction.shape[2])
+        
+        # I want to find the energy gradient of an artificial blockade
+        with torch.enable_grad():
+            naction = naction.clone().detach().requires_grad_(True)
+            dist = torch.linalg.norm(naction - guide, dim=2, ord=2) # (B, pred_horizon)
+            dist = -dist.mean(dim=1) # (B,)
+            grad = torch.autograd.grad(dist, naction, grad_outputs=torch.ones_like(dist), create_graph=False)[0]
+            # naction.detach()
+        return grad   
     
     def guide_gradient(self, naction, guide):
         # naction: (B, pred_horizon, action_dim);
@@ -374,7 +411,7 @@ class EBMDiffusionModel(nn.Module):
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False, get_pret = False) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, normalizer=None, return_energy=False, get_pret = False, high_energy_guide=False) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -393,12 +430,12 @@ class EBMDiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer)
-
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, guide=guide, visualizer=visualizer, normalizer=normalizer, high_energy_guide=high_energy_guide)
+        
         if return_energy:
             energy = self.model(
                         actions,
-                        torch.full(actions.shape[:1], 0, dtype=torch.long, device=sample.device),
+                        torch.full(actions.shape[:1], 0, dtype=torch.long, device=actions.device),
                         global_cond=global_cond, return_energy=True)
         #     return sample, energy
         # print("generate actions", actions.shape)
@@ -734,7 +771,7 @@ class EBMDiffusionModel(nn.Module):
             
             loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
 
-            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_opt.mean())
+            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
         else:
             loss = loss_mse
             return loss.mean(), (loss_mse.mean(), torch.tensor(-1), torch.tensor(-1))

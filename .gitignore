@@ -14,3 +14,4 @@ outputs/*
 data/*
 inference_itps/plots
 maze2d-large-sparse-v1.hdf5
+inference_itps/energy_coll_maps/

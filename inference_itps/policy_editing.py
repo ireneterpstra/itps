@@ -831,7 +831,7 @@ class UnconditionalMaze(MazeEnv):
         pygame.quit()
         
         
-class EnergyConditionalMaze(UnconditionalMaze):
+class FinetuneEnergyMaze(UnconditionalMaze):
     # for interactive guidance dataset collection
     def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None):
         super().__init__(policy, policy_tag=policy_tag)
@@ -839,13 +839,16 @@ class EnergyConditionalMaze(UnconditionalMaze):
         self.keep_drawing = False
         self.vis_dp_dynamics = vis_dp_dynamics
         self.savefile = None
-        self.savepath = savepath
+        self.savepath = savepath 
         self.draw_traj = [] # gui coordinates
         self.xy_pred = None # numpy array
         self.collisions = None # boolean array
         self.scores = None # numpy array
         self.alignment_strategy = alignment_strategy
         self.drawmode = False
+        
+    def tune_model(self):
+        return
         
     def infer_target(self, guide=None, visualizer=None, high_energy_guide=False):
         agent_hist_xy = self.agent_history_xy[-1] 
@@ -873,6 +876,22 @@ class EnergyConditionalMaze(UnconditionalMaze):
         return actions
 
     def run(self):
+        '''
+        1. select start location
+            press key "c"
+            
+        2. select preferred path
+            start drawing with mouse down
+            press key "f" to finish
+            
+        3. fine tune model with low energy at preferred path
+            3.a find paths closest to user preference
+            3.b save paths + energies to dataset
+            3.c fine tune model with new data
+            
+            press key "r" to reset ??
+        
+        '''
         if self.savepath is not None:
             self.savefile = open(self.savepath, "a+", buffering=1)
             self.trial_idx = 0
@@ -886,15 +905,16 @@ class EnergyConditionalMaze(UnconditionalMaze):
                     self.running = False
                     break
                 if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_d:
+                    if event.key == pygame.K_c:
                         self.drawmode = True
                     if event.key == pygame.K_f:
                         self.drawmode = False
-                    if event.key == pygame.K_c:  
+                    if event.key == pygame.K_r:  
                         self.drawmode = False
                         
                         self.keep_drawing = False  
                         self.draw_traj = [] 
+                        
                         # self.save_trials()
                 if self.drawmode: 
                     if any(pygame.mouse.get_pressed()):  # Check if mouse button is pressed
@@ -906,19 +926,6 @@ class EnergyConditionalMaze(UnconditionalMaze):
                         if self.drawing: 
                             self.drawing = False # finish drawing action
                             self.keep_drawing = True # keep visualizing the drawing
-                # if event.type == pygame.KEYDOWN: 
-                #     # press s to save the trial
-                #     if event.key == pygame.K_s and self.savefile is not None:
-                #         self.save_trials()   
-                
-                # if event.type == pygame.KEYDOWN:
-                     
-
-            # if self.keep_drawing: # visualize the human drawing input
-            #     # Check if mouse returns to the agent's location
-            #     if np.linalg.norm(self.mouse_pos - self.agent_gui_pos) < 20:  # Threshold distance to reactivate the agent
-            #         self.keep_drawing = False # delete the drawing
-            #         self.draw_traj = []
 
             if not self.drawing and not self.drawmode: # inference mode
                 if not self.keep_drawing:
