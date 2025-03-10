@@ -151,6 +151,8 @@ class DiffusionConfig:
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
+    
+    supervise_energy_landscape: bool = False
 
     def __post_init__(self):
         """Input validation (not exhaustive)."""

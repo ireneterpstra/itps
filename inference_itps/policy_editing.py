@@ -95,6 +95,7 @@ def update_policy_e(
     """Returns a dictionary of items for logging."""
     start_time = time.perf_counter()
     device = get_device_from_parameters(policy)
+    
     policy.train()
     with torch.autocast(device_type=device.type) if use_amp else nullcontext():
         output_dict = policy.forward_e(batch)
@@ -130,9 +131,9 @@ def update_policy_e(
         optimizer.zero_grad()
 
 
-    if isinstance(policy, PolicyWithUpdate):
-        # To possibly update an internal buffer (for instance an Exponential Moving Average like in TDMPC).
-        policy.update()
+        if isinstance(policy, PolicyWithUpdate):
+            # To possibly update an internal buffer (for instance an Exponential Moving Average like in TDMPC).
+            policy.update()
 
     info = {
         "loss": loss.item(),
@@ -920,7 +921,9 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         dist_mask = torch.where(dist < 0.5, 1, 0)
         # dist_p = dist[dist_mask.bool()]
         idx = torch.nonzero(torch.sum(dist_mask, 1)).squeeze()
+        nidx = torch.where(torch.sum(dist_mask, 1) == 0)[0]
         print("close e path", idx)
+        print("far / low e path", nidx)
         
         # make energies that match that guide 
         e_choice = torch.zeros(energy.size(0)).to(energy.device)
@@ -933,34 +936,77 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         batch["energy"] = energy
         batch["e_choice"] = e_choice
         
-        # print("observation.state", batch["observation.state"].shape)
-        # print("observation.environment_state", batch["observation.environment_state"].shape)
-        # print("action", batch["action"].shape)
-        # print("energy", batch["energy"].shape)
+        # print(self.policy)
+        # for name, layer in self.policy.diffusion.unet.named_children():
+        #     print(name)
+        #     if name in ['diffusion_step_encoder', 'down_modules', 'mid_modules']:
+        #         print("turning off", name)
+        #         for param in layer.parameters():
+        #             param.requires_grad = False
+                    
+        for param in self.policy.diffusion.unet.diffusion_step_encoder.parameters():
+            param.requires_grad = False
+        for param in self.policy.diffusion.unet.down_modules.parameters():
+            param.requires_grad = False
+        for param in self.policy.diffusion.unet.mid_modules.parameters():
+            param.requires_grad = False
+        # for param in self.policy.diffusion.unet.up_modules.parameters():
+        #     param.requires_grad = False
+        for name, param in  self.policy.named_parameters():
+            if param.requires_grad:
+                print(f"Trainable layer: {name}")
+    
+        
         
         # iterate untill model converges or max itter reached
-        max_steps = 30
-        for i in range(max_steps): 
+        max_steps = 100
+        for s in range(max_steps): 
             ###
             #TODO: shuffle batch? 
+            action_low = action.clone()
+            action_low_e = energy.clone()
+            action_high = action.clone()
+            action_high_e = energy.clone()
+            
+            for i in range(action.shape[0]):
+                # pick random low index
+                low_idx = idx[torch.randint(len(idx), (1,))]
+                high_idx = nidx[torch.randint(len(nidx), (1,))]
+                action_low[i] = action[low_idx]
+                action_low_e[i] = energy[low_idx]
+                action_high[i] = action[high_idx]
+                action_high_e[i] = energy[high_idx]
+                
+            batch = self.obs_batch
+            
+            perm_a = action.clone()
+        
+            batch["action"] = perm_a[torch.randperm(perm_a.shape[0])]
+            batch["energy"] = energy
+            batch["e_choice"] = e_choice
+            batch["action_low"] = action_low
+            batch["action_low_e"] = action_low_e
+            batch["action_high"] = action_high
+            batch["action_high_e"] = action_high_e
             ###
+            
             train_info = update_policy_e(
                 self.policy,
                 batch,
                 self.optimizer,
                 self.grad_clip_norm,
-                i, 
+                s, 
                 grad_scaler=self.grad_scaler,
                 use_amp=self.use_amp,
             )
             action_energy = self.policy.get_energy(action_i, copy.deepcopy(self.obs_batch))
             energy_low = action_energy[e_choice.bool()]
             energy_high = action_energy[~e_choice.bool()]
-            if i > 4: 
+            if s > 4: 
             
-                if max(energy_low) < min(energy_high): 
-                    print("policy converged, steps:", i, max(energy_low), min(energy_high))
-                    print("policy converged, steps:", i, energy_low, min(energy_high))
+                if min(energy_low) < min(energy_high): 
+                    print("policy converged, steps:", s, max(energy_low), min(energy_high))
+                    # print("policy converged, steps:", s, energy_low, min(energy_high))
                     break
             print("policy not converged", max(energy_low), min(energy_high))
             
@@ -1093,8 +1139,8 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                         
                         self.keep_drawing = False  
                         self.draw_traj = [] 
-                        
-                        # self.save_trials()
+                        if self.savepath is not None:
+                            self.save_trials()
                 if self.drawmode: 
                     if any(pygame.mouse.get_pressed()):  # Check if mouse button is pressed
                         if not self.drawing:
@@ -1141,8 +1187,8 @@ class FinetuneEnergyMaze(UnconditionalMaze):
             "trial_idx": self.trial_idx,
             "agent_pos": self.agent_gui_pos.tolist(),
             "guide": np.array(self.draw_traj).tolist(),
-            "pred_traj": pred_gui_traj.astype(int).tolist(),
-            "collisions": self.collisions.tolist()
+            # "pred_traj": pred_gui_traj.astype(int).tolist(),
+            # "collisions": self.collisions.tolist()
         }
         self.savefile.write(json.dumps(entry) + "\n")
         print(f"Trial {self.trial_idx} saved to {self.savepath}.")

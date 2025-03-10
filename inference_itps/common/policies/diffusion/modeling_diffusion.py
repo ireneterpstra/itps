@@ -740,32 +740,45 @@ class EBMDiffusionModel(nn.Module):
         loss_mse = loss
             
         # Energy shaping
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-
+        
         energy = self.model(noisy_trajectory, timesteps, global_cond=global_cond, return_energy=True)
         e_choice = batch["e_choice"]
-        # energy_g = batch["energy"]
+        action_low = batch["action_low"]
+        action_low_e = batch["action_low_e"]
+        action_high = batch["action_high"]
+        action_high_e = batch["action_high_e"]
         
-        energy_low = energy[e_choice.bool()]
-        energy_high = energy[~e_choice.bool()]
-        # print("energy_low", energy_low.size())
-        # print("energy_high", energy_high.size())
+        noisy_action_low = self.noise_scheduler.add_noise(action_low, eps, timesteps)
+        noisy_action_high = self.noise_scheduler.add_noise(action_high, eps, timesteps)
         
+        # Compute energy of both distributions
+        global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+        traj_concat = torch.cat([noisy_action_low, noisy_action_high], dim=0)
+        # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+        t_concat = torch.cat([timesteps, timesteps], dim=0)
+        energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
         
-        loss_energy = 0
-        for l in range(energy_low.size(0)): 
-            for h in range(energy_high.size(0)): 
-                energy_stack = torch.cat([energy_low[l:l+1], energy_high[h:h+1]], dim=-1)
-                # print("energy_stack", energy_stack)
-                # target = torch.zeros(energy_stack.size(0)).to(energy_stack.device)
-                loss_ep = -F.log_softmax(-1 * energy_stack, dim=1)
-                # loss_epc = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
-                # print("loss", loss_ep[0,0], loss_epc)
-                loss_energy += loss_ep[0, 0]    
+        # Compute noise contrastive energy loss
+        energy_low, energy_high = torch.chunk(energy, 2, 0)
+        energy_stack = torch.cat([energy_low, energy_high], dim=-1)
+        # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
+        target = torch.zeros(energy_low.size(0)).to(energy_stack.device)
+        loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
         
-        print("loss energy", loss_energy)
-        loss_scale_e = 0.001 #0.0001
-        loss_scale_m = 1
+        # loss_energy = 0
+        # for l in range(energy_low.size(0)): 
+        #     for h in range(energy_high.size(0)): 
+        #         energy_stack = torch.cat([energy_low[l:l+1], energy_high[h:h+1]], dim=-1)
+        #         # print("energy_stack", energy_stack)
+        #         # target = torch.zeros(energy_stack.size(0)).to(energy_stack.device)
+        #         loss_ep = -F.log_softmax(-1 * energy_stack, dim=1)
+        #         # loss_epc = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
+        #         # print("loss", loss_ep[0,0], loss_epc)
+        #         loss_energy += loss_ep[0, 0]    
+        
+        # print("loss enercgy", loss_energy)
+        loss_scale_e = 1 #0.0001
+        loss_scale_m = 0.1
         loss = loss_scale_m * loss_mse + loss_scale_e * loss_energy # + 0.001 * loss_opt
 
         return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
