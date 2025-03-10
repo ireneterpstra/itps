@@ -50,6 +50,10 @@ import argparse
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
+from torch.cuda.amp import GradScaler
+from contextlib import nullcontext
+from omegaconf import DictConfig
+
 import einops
 from pathlib import Path
 from huggingface_hub import snapshot_download
@@ -58,6 +62,9 @@ from common.policies.act.modeling_act import ACTPolicy
 from common.policies.rollout_wrapper import PolicyRolloutWrapper
 from common.utils.utils import seeded_context, init_hydra_config
 from common.policies.factory import make_policy
+from common.policies.utils import get_device_from_parameters
+from common.policies.policy_protocol import PolicyWithUpdate
+from common.logger import Logger, log_output_dir
 from common.datasets.factory import make_dataset
 from common.utils.path_utils import perturb_traj, generate_trajs
 from scipy.special import softmax
@@ -73,6 +80,74 @@ from mpl_toolkits.mplot3d import axes3d
 import pickle as pl
 import datetime
 
+def update_policy_e(
+    policy,
+    batch,
+    optimizer,
+    grad_clip_norm,
+    step, 
+    grad_scaler: GradScaler,
+    use_amp: bool = False,
+    lock=None,
+    grad_accumulation_steps: int = 2
+    
+):
+    """Returns a dictionary of items for logging."""
+    start_time = time.perf_counter()
+    device = get_device_from_parameters(policy)
+    policy.train()
+    with torch.autocast(device_type=device.type) if use_amp else nullcontext():
+        output_dict = policy.forward_e(batch)
+        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+        loss = output_dict["loss"]
+        loss_denoise, loss_energy, loss_opt = output_dict["sub_loss"]
+        
+    grad_scaler.scale(loss).backward()
+
+    # Unscale the graident of the optimzer's assigned params in-place **prior to gradient clipping**.
+    grad_scaler.unscale_(optimizer)
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        policy.parameters(),
+        grad_clip_norm,
+        error_if_nonfinite=False,
+    )
+
+
+    # Gradient Acccumulation: Only update every grad_accumulation_steps 
+    if (step+1)%grad_accumulation_steps == 0:
+        print("acc step")
+        # optimizer.step()
+        # optimizer.zero_grad()
+        
+        # Optimizer's gradients are already unscaled, so scaler.step does not unscale them,
+        # although it still skips optimizer.step() if the gradients contain infs or NaNs.
+        with lock if lock is not None else nullcontext():
+            grad_scaler.step(optimizer)
+        # Updates the scale for next iteration.
+        grad_scaler.update()
+
+        optimizer.zero_grad()
+
+
+    if isinstance(policy, PolicyWithUpdate):
+        # To possibly update an internal buffer (for instance an Exponential Moving Average like in TDMPC).
+        policy.update()
+
+    info = {
+        "loss": loss.item(),
+        "loss_denoise": loss_denoise.item(), 
+        "loss_energy": loss_energy.item(), 
+        "loss_opt": loss_opt.item(),
+        "grad_norm": float(grad_norm),
+        "lr": optimizer.param_groups[0]["lr"],
+        "update_s": time.perf_counter() - start_time,
+        **{k: v for k, v in output_dict.items() if (k != "loss" and k != "sub_loss") },
+    }
+    # print(info)
+    info.update({k: v for k, v in output_dict.items() if k not in info and k != "sub_loss"})
+    print(info)
+    return info
 
 class MazeEnv:
     def __init__(self):
@@ -247,33 +322,32 @@ class MazeEnv:
         return samples, scores
     
     
-class CollisionMapper(MazeEnv):
-    def __init__(self, policy, policy_tag=None):
+class CollisionMapper:
+    def __init__(self, policy, maze, policy_tag="None"):
         super().__init__()
         self.mouse_pos = None
         self.agent_in_collision = False
         self.agent_history_xy = []
         self.policy = policy
+        self.batch_size = 32    
         self.policy_tag = policy_tag
         self.coll_perc_hist = dict()
         
+        self.maze = maze
+        
         self.scale = 10
-        self.scale_x = int((self.gui_size[0]-200)/self.scale)
-        self.scale_y = int((self.gui_size[1]-200)/self.scale)
+        self.scale_x = int((self.maze.gui_size[0]-200)/self.scale)
+        self.scale_y = int((self.maze.gui_size[1]-200)/self.scale)
         
         self.coll_map = np.zeros((self.scale_y, self.scale_x))  
         self.energy_map = np.zeros_like(self.coll_map)  
         
-    def infer_target(self, xy = None, guide=None, visualizer=None, return_energy=False):
-        if xy is None: 
-            agent_hist_xy = self.agent_history_xy[-1] 
-            # print("agent xy", agent_hist_xy)
-        else: 
-            agent_hist_xy = xy
+    def infer_target(self, xy, guide=None, visualizer=None, return_energy=False):
+        agent_hist_xy = xy
             
         agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
-        if self.policy_tag[:2] == 'dp':
-            agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
+        
+        agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
             
     
 
@@ -297,12 +371,7 @@ class CollisionMapper(MazeEnv):
                 return a_out, e_out
             else:
                 return self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer, return_energy=return_energy).cpu().numpy() # directly call the policy in order to visualize the intermediate steps
-    
-    def generate_coll_color_map(self, num_steps):
-        cmap = plt.get_cmap('viridis')
-        values = np.linspace(0, 1, num_steps)
-        colors = cmap(values)
-        return colors
+
     
     def plot_coll_energy(self, coll, energy, tag="", dpi=150):
         fig, ax = plt.subplots(1, 2, figsize=(10, 3))
@@ -320,41 +389,20 @@ class CollisionMapper(MazeEnv):
         
         plt.savefig(f"energy_coll_map_{self.policy_tag}_{tag}.png", dpi=dpi)
     
-    def update_coll_screen(self, xy_pred=None, collisions=None, scores=None, keep_drawing=False, traj_in_gui_space=False):
-        self.draw_maze_background()
-        
-        coll_colors = self.generate_coll_color_map(101)
-        
-        # scale = 10
-        # scale_x = int(self.gui_size[0]/scale)
-        # scale_y = int(self.gui_size[1]/scale)
-        
-        # coll_map = np.zeros((scale_y, scale_x))  
-        # energy_map = np.zeros_like(coll_map)      
-        
-        # xi = 0
-        # yi = 0
+    def generate_collision_map(self):
+
         for y in range(0, self.scale_y):
             for x in range(0, self.scale_x):
-                # print("xy", x, y)
-                # if y < 10 or y > 110 or x < 10  or x > 80: 
-                #     break
+ 
 
                 xi = (x+10) * self.scale
                 yi = (y+10) * self.scale
                 gui_xy = tuple([xi,yi])
-                xy = self.gui2xy(gui_xy)
-                # maze_x = np.round(xy[0]).astype(int)
-                # maze_y = np.round(xy[1]).astype(int)
-                
-                # collision = self.maze[maze_x, maze_y]
-                # if collision: 
-                #     coll_perc = 100
-                #     energy_c = 0
-                # else: 
+                xy = self.maze.gui2xy(gui_xy)
+
                 xy_pred, energy = self.infer_target(xy, return_energy=True)
-                collisions = self.check_collision(xy_pred)
-                coll_perc = self.report_collision_percentage(collisions)
+                collisions = self.maze.check_collision(xy_pred)
+                coll_perc = self.maze.report_collision_percentage(collisions)
                 energy_c = energy.sum()
                 
                 # print("loc", x, y, xy)
@@ -368,51 +416,6 @@ class CollisionMapper(MazeEnv):
                 self.plot_coll_energy(self.coll_map, self.energy_map, tag="test")
         
         self.plot_coll_energy(self.coll_map, self.energy_map, tag="f", dpi=300)
-
-    
-    def update_mouse_pos(self):
-        self.mouse_pos = np.array(pygame.mouse.get_pos())
-
-    def update_agent_pos(self, new_agent_pos, history_len=1):
-        self.agent_gui_pos = np.array(new_agent_pos)
-        agent_xy_pos = self.gui2xy(self.agent_gui_pos)
-        self.agent_in_collision = self.check_collision(agent_xy_pos.reshape(1, 1, 2))[0]
-        if self.agent_in_collision:
-            self.agent_color = self.blend_with_white(self.RED, 0.8)
-        else:
-            self.agent_color = self.RED        
-        self.agent_history_xy.append(agent_xy_pos)
-        self.agent_history_xy = self.agent_history_xy[-history_len:]
-
-    def run(self):
-        
-
-        self.update_coll_screen()
-        pygame.quit()
-
-
-        
-        # while self.running:
-        #     self.update_mouse_pos()
-            
-        #     # Handle events
-        #     for event in pygame.event.get():
-        #         if event.type == pygame.QUIT:
-        #             self.running = False
-        #             break
-                
-            
-                    
-
-        #     self.update_agent_pos(self.mouse_pos.copy())
-        #     xy_pred = self.infer_target()
-            
-            
-            
-            
-        #     self.clock.tick(30)
-
-        # pygame.quit()
     
     
 class UnconditionalMazeTopo(MazeEnv):
@@ -503,7 +506,7 @@ class UnconditionalMazeTopo(MazeEnv):
         colors = cmap(energies_norm)
         return colors
         
-    def update_screen_energy(self, xy_pred=None, energies=None, collisions=None):
+    def update_screen_energy(self, xy_pred=None, energies=None, collisions=None, keep_drawing=False):
         self.draw_maze_background()
         print((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), self.gui2xy((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])))) 
         if xy_pred is not None:
@@ -531,7 +534,10 @@ class UnconditionalMazeTopo(MazeEnv):
                     pygame.draw.circle(self.screen, color, start_pos, circle_size)
 
         pygame.draw.circle(self.screen, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 20)
-  
+        if keep_drawing: # visualize the human drawing input
+            for i in range(len(self.draw_traj) - 1):
+                pygame.draw.line(self.screen, self.RED, self.draw_traj[i], self.draw_traj[i + 1], 10)
+
         pygame.display.flip()
 
     def infer_target(self, guide=None, visualizer=None, num_inc=1, return_topo=False):
@@ -833,24 +839,47 @@ class UnconditionalMaze(MazeEnv):
         
 class FinetuneEnergyMaze(UnconditionalMaze):
     # for interactive guidance dataset collection
-    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None):
+    def __init__(self, policy, savepath=None, policy_tag=None):
         super().__init__(policy, policy_tag=policy_tag)
         self.drawing = False
         self.keep_drawing = False
-        self.vis_dp_dynamics = vis_dp_dynamics
+        #Add back in vis if neccesary
+        # self.vis_dp_dynamics = vis_dp_dynamics
         self.savefile = None
         self.savepath = savepath 
         self.draw_traj = [] # gui coordinates
         self.xy_pred = None # numpy array
         self.collisions = None # boolean array
         self.scores = None # numpy array
-        self.alignment_strategy = alignment_strategy
+        # self.alignment_strategy = alignment_strategy
         self.drawmode = False
+        self.finetune = False
         
-    def tune_model(self):
-        return
+        #Training Params
+        self.use_amp=False
+        self.lr = 1.0e-6
+        self.adam_betas = [0.95, 0.999]
+        self.adam_eps = 1.0e-8
+        self.adam_weight_decay = 1.0e-6
+        # self.lr_scheduler
+        # self.lr_warmup_steps
+        self.grad_clip_norm = 10
         
-    def infer_target(self, guide=None, visualizer=None, high_energy_guide=False):
+        self.optimizer = torch.optim.Adam(
+            self.policy.diffusion.parameters(),
+            self.lr,
+            self.adam_betas,
+            self.adam_eps,
+            self.adam_weight_decay,
+        )
+        
+        self.grad_scaler = GradScaler(enabled=self.use_amp)
+        
+        # self.coll_mapper = CollisionMapper(self.policy, self, policy_tag="tuned_" + self.policy_tag)
+        
+        # self.logger = Logger(cfg, out_dir, wandb_job_name=job_name)
+        
+    def gen_obs_batch(self):
         agent_hist_xy = self.agent_history_xy[-1] 
         agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
         if self.policy_tag[:2] == 'dp':
@@ -864,25 +893,168 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         obs_batch["observation.environment_state"] = einops.repeat(
             torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
         )
+        return obs_batch
         
-        if guide is not None:
-            guide = torch.from_numpy(guide).float().cuda()
+        
+    def tune_model(self, guide):
+        guide = torch.from_numpy(guide).float().cuda()
+        
+        action_i = torch.from_numpy(self.xy_pred).float().cuda()
+        action = torch.cat((action_i, action_i[:, -1:, :]), 1)
+        energy = torch.from_numpy(self.energy).float().cuda()
+        # self.energy
+        print("action shape", action.size())
+        
+        
+        # find path closest to guide
+        #TODO: Pick 
+        assert action.shape[2] == 2 and guide.shape[1] == 2
+        indices = torch.linspace(0, guide.shape[0]-1, action.shape[1], dtype=int)
+        guide = torch.unsqueeze(guide[indices], dim=0)
+        dist = torch.linalg.norm(action - guide, dim=2, ord=2) # (B, pred_horizon)
+        print("min dist", torch.min(dist).item())
+        if torch.min(dist) > 0.5: 
+            #TODO: pick closest anyways
+            raise ValueError(f"Guide not close to any paths {torch.min(dist)}")
+        # TODO: Throw error if all paths are high
+        dist_mask = torch.where(dist < 0.5, 1, 0)
+        # dist_p = dist[dist_mask.bool()]
+        idx = torch.nonzero(torch.sum(dist_mask, 1)).squeeze()
+        print("close e path", idx)
+        
+        # make energies that match that guide 
+        e_choice = torch.zeros(energy.size(0)).to(energy.device)
+        e_choice[idx] = 1
+
+        # gen batch
+        batch = self.obs_batch
+        
+        batch["action"] = action
+        batch["energy"] = energy
+        batch["e_choice"] = e_choice
+        
+        # print("observation.state", batch["observation.state"].shape)
+        # print("observation.environment_state", batch["observation.environment_state"].shape)
+        # print("action", batch["action"].shape)
+        # print("energy", batch["energy"].shape)
+        
+        # iterate untill model converges or max itter reached
+        max_steps = 30
+        for i in range(max_steps): 
+            ###
+            #TODO: shuffle batch? 
+            ###
+            train_info = update_policy_e(
+                self.policy,
+                batch,
+                self.optimizer,
+                self.grad_clip_norm,
+                i, 
+                grad_scaler=self.grad_scaler,
+                use_amp=self.use_amp,
+            )
+            action_energy = self.policy.get_energy(action_i, copy.deepcopy(self.obs_batch))
+            energy_low = action_energy[e_choice.bool()]
+            energy_high = action_energy[~e_choice.bool()]
+            if i > 4: 
+            
+                if max(energy_low) < min(energy_high): 
+                    print("policy converged, steps:", i, max(energy_low), min(energy_high))
+                    print("policy converged, steps:", i, energy_low, min(energy_high))
+                    break
+            print("policy not converged", max(energy_low), min(energy_high))
+            
+        # I dont want an energy map I want to plot energies of my paths
+        # coll_mapper = CollisionMapper(self.policy, self, policy_tag="tuned_" + self.policy_tag)
+        # coll_mapper.generate_collision_map()
+            
+        # logger.save_checkpont(
+        #     step,
+        #     policy,
+        #     optimizer,
+        #     lr_scheduler,
+        #     identifier=step_identifier,
+        # )
+
+        # return info
+        return
+    
+    def generate_energy_color_map(self, energies):
+        num_es = len(energies)
+        cmap = plt.get_cmap('rainbow')
+        energies_norm = (energies-np.min(energies))/(np.max(energies)-np.min(energies))
+        # values = np.linspace(0, 1, num_es)
+        # print("min - max energies", np.min(energies), np.max(energies))
+        colors = cmap(energies_norm)
+        return colors
+    
+    def update_screen_energy(self, xy_pred=None, energies=None, collisions=None, keep_drawing=False):
+        self.draw_maze_background()
+        # print((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), self.gui2xy((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])))) 
+        if xy_pred is not None:
+            # print(energies.shape)
+            energy_colors = self.generate_energy_color_map(energies.squeeze())
+            time_colors = self.generate_time_color_map(xy_pred.shape[1])
+            cmap = ListedColormap(["darkorange", "lightseagreen", "lawngreen", "pink"]) #"lawngreen", 
+            # colors = cmap(c)
+            if collisions is None:
+                collisions = self.check_collision(xy_pred)
+            self.report_collision_percentage(collisions)
+            for idx, pred in enumerate(xy_pred):
+                # print(energy_colors)
+                color = (energy_colors[idx, :3] * 255).astype(int)
+                for step_idx in range(len(pred) - 1):
+                    # color = (time_colors[step_idx, :3] * 255).astype(int)
+                    # color = (time_colors[step_idx, :3] * 255).astype(int)
+                    
+                    # visualize constraint violations (collisions) by tinting trajectories white
+                    whiteness_factor = 0.1 if collisions[idx] else 0.0 
+                    # color = self.blend_with_white(color, whiteness_factor)
+                    if idx < 32: 
+                        circle_size = 5
+                    else: 
+                        circle_size = 2
+                        
+                    # print("color", color)
+                    
+                    start_pos = self.xy2gui(pred[step_idx])
+                    end_pos = self.xy2gui(pred[step_idx + 1])
+                    pygame.draw.circle(self.screen, color, start_pos, circle_size)
+
+        pygame.draw.circle(self.screen, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 20)
+        if keep_drawing: # visualize the human drawing input
+            for i in range(len(self.draw_traj) - 1):
+                pygame.draw.line(self.screen, self.RED, self.draw_traj[i], self.draw_traj[i + 1], 10)
+
+        pygame.display.flip()
+    
+        
+    def infer_target(self, guide=None):
+        obs_batch = self.gen_obs_batch()
 
         with torch.autocast(device_type="cuda"), seeded_context(0):
-            if self.policy_tag == 'act':
-                actions = self.policy.run_inference(obs_batch).cpu().numpy()
-            else:
-                actions = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer, high_energy_guide=high_energy_guide).cpu().numpy() # directly call the policy in order to visualize the intermediate steps
-        return actions
+            actions, energy = self.policy.run_inference(obs_batch, guide=guide, return_energy=True) # directly call the policy in order to visualize the intermediate steps
+            actions = actions.detach().cpu().numpy()
+            energy = energy.detach().cpu().numpy()
+        return actions, energy, obs_batch
 
     def run(self):
         '''
+        States: 
+            inference 
+            drawing
+            tuning
+        
         1. select start location
             press key "c"
+                enter drawmode
             
         2. select preferred path
+            (future note maybe hilight closest path)
             start drawing with mouse down
             press key "f" to finish
+                end drawmode
+                eneter finetune
             
         3. fine tune model with low energy at preferred path
             3.a find paths closest to user preference
@@ -890,14 +1062,21 @@ class FinetuneEnergyMaze(UnconditionalMaze):
             3.c fine tune model with new data
             
             press key "r" to reset ??
+                
         
         '''
         if self.savepath is not None:
             self.savefile = open(self.savepath, "a+", buffering=1)
             self.trial_idx = 0
 
+        mouse_pos = [[640, 730], [650, 550], [1050, 150], [630, 150], [860, 340]]
+        i = np.random.randint(len(mouse_pos))
+        self.start_loc = mouse_pos[i]
+
         while self.running:
             self.update_mouse_pos()
+            # print("start pos", self.start_loc)
+            
 
             # Handle events
             for event in pygame.event.get():
@@ -907,8 +1086,8 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_c:
                         self.drawmode = True
-                    if event.key == pygame.K_f:
-                        self.drawmode = False
+                    # if event.key == pygame.K_f:
+                    #     self.drawmode = False
                     if event.key == pygame.K_r:  
                         self.drawmode = False
                         
@@ -925,26 +1104,30 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                     else: # mouse released
                         if self.drawing: 
                             self.drawing = False # finish drawing action
-                            self.keep_drawing = True # keep visualizing the drawing
-
-            if not self.drawing and not self.drawmode: # inference mode
-                if not self.keep_drawing:
-                    self.update_agent_pos(self.mouse_pos.copy())
+                            self.keep_drawing = True # keep visualizing the drawing    
+                            self.finetune = True                        
+            if self.finetune: 
                 if len(self.draw_traj) > 0:
                     guide = np.array([self.gui2xy(point) for point in self.draw_traj])
+                    self.tune_model(guide)
+                else: 
+                    raise RuntimeError("No guidance found")
+                self.finetune = False
+                
+            elif not self.drawing and not self.drawmode: # inference mode
+                if not self.keep_drawing:
+                    self.update_agent_pos(self.start_loc.copy())
+                if len(self.draw_traj) > 0:
+                    raise RuntimeError("Should be in tuning state")
                 else:
                     guide = None
-                self.xy_pred = self.infer_target(guide, visualizer=(self if self.vis_dp_dynamics and self.keep_drawing else None), high_energy_guide=True)
-                self.scores = None
-                if self.alignment_strategy == 'post-hoc' and guide is not None:
-                    xy_pred, scores = self.similarity_score(self.xy_pred, guide)
-                    self.xy_pred = xy_pred
-                    self.scores = scores
+                self.xy_pred, self.energy, self.obs_batch = self.infer_target()
+
                 self.collisions = self.check_collision(self.xy_pred)
 
-            self.update_screen(self.xy_pred, self.collisions, self.scores, (self.keep_drawing or self.drawing))
-            if self.vis_dp_dynamics and not self.drawing and self.keep_drawing:
-                time.sleep(1)
+            self.update_screen_energy(self.xy_pred, self.energy, self.collisions, (self.keep_drawing or self.drawing))
+            # if self.vis_dp_dynamics and not self.drawing and self.keep_drawing:
+            #     time.sleep(1)
             self.clock.tick(30)
 
         pygame.quit()
@@ -1259,7 +1442,7 @@ if __name__ == "__main__":
         interactiveMaze = MazeExp(policy, args.vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, loadpath=args.loadpath)
     elif args.energy_guide:
         print("eg")
-        interactiveMaze = EnergyConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag)
+        interactiveMaze = FinetuneEnergyMaze(policy, args.savepath, policy_tag=policy_tag)
 
     else:
         interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag)
