@@ -855,6 +855,7 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         # self.alignment_strategy = alignment_strategy
         self.drawmode = False
         self.finetune = False
+        self.picking_start_pos = True
         
         #Training Params
         self.use_amp=False
@@ -913,17 +914,25 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         indices = torch.linspace(0, guide.shape[0]-1, action.shape[1], dtype=int)
         guide = torch.unsqueeze(guide[indices], dim=0)
         dist = torch.linalg.norm(action - guide, dim=2, ord=2) # (B, pred_horizon)
-        print("min dist", torch.min(dist).item())
-        if torch.min(dist) > 0.5: 
-            #TODO: pick closest anyways
-            raise ValueError(f"Guide not close to any paths {torch.min(dist)}")
-        # TODO: Throw error if all paths are high
-        dist_mask = torch.where(dist < 0.5, 1, 0)
+        dist = dist.mean(dim=1)
+        idx_sort = torch.argsort(dist, dim=0)
+        print("idx_sort", idx_sort, dist[idx_sort]-min(dist))
+        # return
+        dist_mask_idx = torch.where(dist[idx_sort]-min(dist) < 0.25, 1, 0)
+        # if torch.min(dist) > 0.5: 
+        #     #TODO: pick closest anyways
+        #     raise ValueError(f"Guide not close to any paths {torch.min(dist)}")
+        # # TODO: Throw error if all paths are high
+        # dist_mask = torch.where(dist < 0.5, 1, 0)
         # dist_p = dist[dist_mask.bool()]
-        idx = torch.nonzero(torch.sum(dist_mask, 1)).squeeze()
-        nidx = torch.where(torch.sum(dist_mask, 1) == 0)[0]
+        # idx = torch.nonzero(torch.sum(dist_mask, 1)).squeeze()
+        # nidx = torch.where(torch.sum(dist_mask, 1) == 0)[0]
+        
+        idx = idx_sort[dist_mask_idx.bool()]
+        nidx = idx_sort[~dist_mask_idx.bool()]
         print("close e path", idx)
         print("far / low e path", nidx)
+        # return
         
         # make energies that match that guide 
         e_choice = torch.zeros(energy.size(0)).to(energy.device)
@@ -959,10 +968,9 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         
         
         # iterate untill model converges or max itter reached
-        max_steps = 100
+        max_steps = 300
         for s in range(max_steps): 
-            ###
-            #TODO: shuffle batch? 
+            #Shuffle batch
             action_low = action.clone()
             action_low_e = energy.clone()
             action_high = action.clone()
@@ -1006,7 +1014,7 @@ class FinetuneEnergyMaze(UnconditionalMaze):
             
                 if min(energy_low) < min(energy_high): 
                     print("policy converged, steps:", s, max(energy_low), min(energy_high))
-                    # print("policy converged, steps:", s, energy_low, min(energy_high))
+                    print("policy converged, steps:", s, energy_low, energy_high)
                     break
             print("policy not converged", max(energy_low), min(energy_high))
             
@@ -1029,9 +1037,11 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         num_es = len(energies)
         cmap = plt.get_cmap('rainbow')
         energies_norm = (energies-np.min(energies))/(np.max(energies)-np.min(energies))
+        # print("min norm", np.argmin(energies_norm))
         # values = np.linspace(0, 1, num_es)
         # print("min - max energies", np.min(energies), np.max(energies))
         colors = cmap(energies_norm)
+        # print("colors", colors)
         return colors
     
     def update_screen_energy(self, xy_pred=None, energies=None, collisions=None, keep_drawing=False):
@@ -1040,6 +1050,7 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         if xy_pred is not None:
             # print(energies.shape)
             energy_colors = self.generate_energy_color_map(energies.squeeze())
+            # print("min energies", np.argmin(energies))
             time_colors = self.generate_time_color_map(xy_pred.shape[1])
             cmap = ListedColormap(["darkorange", "lightseagreen", "lawngreen", "pink"]) #"lawngreen", 
             # colors = cmap(c)
@@ -1049,6 +1060,7 @@ class FinetuneEnergyMaze(UnconditionalMaze):
             for idx, pred in enumerate(xy_pred):
                 # print(energy_colors)
                 color = (energy_colors[idx, :3] * 255).astype(int)
+                
                 for step_idx in range(len(pred) - 1):
                     # color = (time_colors[step_idx, :3] * 255).astype(int)
                     # color = (time_colors[step_idx, :3] * 255).astype(int)
@@ -1130,6 +1142,10 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                     self.running = False
                     break
                 if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_s:
+                        self.picking_start_pos = not self.picking_start_pos
+                    # if event.key == pygame.K_:
+                    #     self.drawmode = True
                     if event.key == pygame.K_c:
                         self.drawmode = True
                     # if event.key == pygame.K_f:
@@ -1162,6 +1178,8 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                 
             elif not self.drawing and not self.drawmode: # inference mode
                 if not self.keep_drawing:
+                    if self.picking_start_pos: 
+                        self.start_loc = self.mouse_pos.copy()
                     self.update_agent_pos(self.start_loc.copy())
                 if len(self.draw_traj) > 0:
                     raise RuntimeError("Should be in tuning state")
