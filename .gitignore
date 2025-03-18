@@ -1,7 +1,10 @@
 itps/common/*/__pycache__/
 itps/common/policies/*/__pycache__/
-itps/weights_*/
-itps/weights_*
+inference_itps/common/datasets/__pycache__/
+**/__pycache__
+itps/weights/weights_*/
+itps/weights/weights_*
+inference_itps/weights
 inference_itps/weights_*/
 inference_itps/weights_*
 itps/weights_*.zip

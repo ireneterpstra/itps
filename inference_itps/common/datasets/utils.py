@@ -80,28 +80,92 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
     return items_dict
 
 
-def load_hf_dataset(repo_id, version, root, split) -> datasets.Dataset:
+def load_hf_dataset(repo_id: str, version: str, root: Path, split: str) -> datasets.Dataset:
     """hf_dataset contains all the observations, states, actions, rewards, etc."""
     if root is not None:
-        hf_dataset = load_from_disk(str(Path(root) / repo_id / "train"))
-        # TODO(rcadene): clean this which enables getting a subset of dataset
-        if split != "train":
-            if "%" in split:
-                raise NotImplementedError(f"We dont support splitting based on percentage for now ({split}).")
-            match_from = re.search(r"train\[(\d+):\]", split)
-            match_to = re.search(r"train\[:(\d+)\]", split)
-            if match_from:
-                from_frame_index = int(match_from.group(1))
-                hf_dataset = hf_dataset.select(range(from_frame_index, len(hf_dataset)))
-            elif match_to:
-                to_frame_index = int(match_to.group(1))
-                hf_dataset = hf_dataset.select(range(to_frame_index))
-            else:
-                raise ValueError(
-                    f'`split` ({split}) should either be "train", "train[INT:]", or "train[:INT]"'
-                )
+        if 'hdf5' in root: # maze2d dataset
+            import h5py
+            import numpy as np
+            print(root)
+            with h5py.File(root, 'r') as hdf5_file:
+                # skip every 4th frame to match the original dataset
+                observations = np.array(hdf5_file['observations'])[:1000004][::4]
+                timeouts = np.array(hdf5_file['timeouts'])[:1000000][::4]
+
+            def create_episode_and_frame_indices(timeouts):
+                episode_endings = np.where(timeouts)[0]  # Indices where episodes end
+                episode_lengths = np.diff(np.concatenate(([0], episode_endings + 1)))  # Lengths of episodes
+                # Add the length of the last episode (from the last timeout to the end)
+                last_episode_length = len(timeouts) - episode_endings[-1] - 1
+                episode_lengths = np.append(episode_lengths, last_episode_length)
+                # Generate episode indices by repeating the episode number for each episode length
+                episode_index = np.repeat(np.arange(len(episode_lengths)), episode_lengths)
+                # Generate frame indices by concatenating ranges for each episode, restarting from 0
+                frame_index = np.concatenate([np.arange(length) for length in episode_lengths])
+                index = np.arange(len(timeouts))
+                return episode_index, frame_index, index
+            
+            episode_index, frame_index, index = create_episode_and_frame_indices(timeouts)
+            data_dict = {
+                'observation.state': observations[:-1, :2],
+                'observation.environment_state': observations[:-1, :2],
+                'action': observations[1:, :2],
+                'episode_index': episode_index,
+                'frame_index': frame_index,
+                'timestamp': np.copy(frame_index)/10.0,
+                'index': index
+            }
+            hf_dataset = datasets.Dataset.from_dict(data_dict)
+        elif 'zarr' in root: # diffusion policy repo data format
+            import numpy as np
+            
+            def create_episode_and_frame_indices_from_episode_ends(episode_ends):
+                episode_lengths = np.diff(np.concatenate(([0], episode_ends)))  # Lengths of episodes
+                # Generate episode indices by repeating the episode number for each episode length
+                episode_index = np.repeat(np.arange(len(episode_lengths)), episode_lengths)
+                # Generate frame indices by concatenating ranges for each episode, restarting from 0
+                frame_index = np.concatenate([np.arange(length) for length in episode_lengths])
+                index = np.arange(episode_ends[-1])
+                return episode_index, frame_index, index   
+
+            zarr_data = DiffusionPolicyReplayBuffer.copy_from_path(zarr_path=root)
+            action = zarr_data['action']
+            state = zarr_data['state']
+            episode_ends = zarr_data.meta['episode_ends']
+            episode_index, frame_index, index = create_episode_and_frame_indices_from_episode_ends(episode_ends)
+            data_dict = {
+                'observation.state': state,
+                'observation.environment_state': state,
+                'action': action,
+                'episode_index': episode_index,
+                'frame_index': frame_index,
+                'timestamp': np.copy(frame_index)/10.0,
+                'index': index
+            }
+            hf_dataset = datasets.Dataset.from_dict(data_dict)
+
+        else:
+            hf_dataset = load_from_disk(str(Path(root) / repo_id / "train"))
+            # TODO(rcadene): clean this which enables getting a subset of dataset
+            if split != "train":
+                if "%" in split:
+                    raise NotImplementedError(f"We dont support splitting based on percentage for now ({split}).")
+                match_from = re.search(r"train\[(\d+):\]", split)
+                match_to = re.search(r"train\[:(\d+)\]", split)
+                if match_from:
+                    from_frame_index = int(match_from.group(1))
+                    hf_dataset = hf_dataset.select(range(from_frame_index, len(hf_dataset)))
+                elif match_to:
+                    to_frame_index = int(match_to.group(1))
+                    hf_dataset = hf_dataset.select(range(to_frame_index))
+                else:
+                    raise ValueError(
+                        f'`split` ({split}) should either be "train", "train[INT:]", or "train[:INT]"'
+                    )   
     else:
-        hf_dataset = load_dataset(repo_id, revision=version, split=split)
+        safe_version = get_hf_dataset_safe_version(repo_id, version)
+        hf_dataset = load_dataset(repo_id, revision=safe_version, split=split)
+
     hf_dataset.set_transform(hf_transform_to_torch)
     return hf_dataset
 

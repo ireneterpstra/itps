@@ -572,7 +572,7 @@ class EBMDiffusionModel(nn.Module):
             data_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps) # self.q_sample(x_start = x_start, t = t, noise = noise)
             
             # Curruption Function: construct a set of negative labels
-            # xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+            xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
             
             # two trees adding the same noise to both the positve and negative datapoint
                 # need to make sure that my sample from clean data is matching corresponding  perturbed version
@@ -586,11 +586,11 @@ class EBMDiffusionModel(nn.Module):
             # else: 
             # pert_traj = self.perturb_trajectory(trajectory)
             
-            collision = batch["collision"]
-            collision_free = batch["collision_free"]
+            # collision = batch["collision"]
+            # collision_free = batch["collision_free"]
             
-            collision_sample = self.noise_scheduler.add_noise(collision, eps, timesteps)
-            collision_free_sample = self.noise_scheduler.add_noise(collision_free, eps, timesteps)
+            # collision_sample = self.noise_scheduler.add_noise(collision, eps, timesteps)
+            # collision_free_sample = self.noise_scheduler.add_noise(collision_free, eps, timesteps)
                 
             # if self.i % 2 == 0: 
             #     self.plot_energies(trajectory, pert_traj)
@@ -613,32 +613,34 @@ class EBMDiffusionModel(nn.Module):
             ##### how neccesary is this? retrain w/o this
             
             
-            
-            # # Compute energy of both distributions
-            # global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
-            # traj_concat = torch.cat([data_sample, collision_sample], dim=0)
-            # # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
-            # t_concat = torch.cat([timesteps, timesteps], dim=0)
-            # energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
-            
-            # # Compute noise contrastive energy loss
-            # energy_real, energy_fake = torch.chunk(energy, 2, 0)
-            # energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
-            # # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
-            # target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
-            
-            # Compute energy of all distributions
-            global_cond_concat = torch.cat([global_cond, global_cond, global_cond], dim=0)
-            traj_concat = torch.cat([data_sample, collision_sample, collision_free_sample], dim=0)
+            #### noise constrative loss
+            # Compute energy of both distributions
+            global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+            traj_concat = torch.cat([data_sample, xmin_noise], dim=0)
             # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
-            t_concat = torch.cat([timesteps, timesteps, timesteps], dim=0)
+            t_concat = torch.cat([timesteps, timesteps], dim=0)
             energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
             
             # Compute noise contrastive energy loss
-            energy_real, energy_collision, energy_collision_free = torch.chunk(energy, 3, 0)
-            energy_stack = torch.cat([energy_real, energy_collision], dim=-1)
-            energy_stack_cf = torch.cat([energy_real, energy_collision_free], dim=-1)
+            energy_real, energy_fake = torch.chunk(energy, 2, 0)
+            energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
+            # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
             target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
+            
+            
+            #### 3 collision constrative loss
+            # # Compute energy of all distributions
+            # global_cond_concat = torch.cat([global_cond, global_cond, global_cond], dim=0)
+            # traj_concat = torch.cat([data_sample, collision_sample, collision_free_sample], dim=0)
+            # # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+            # t_concat = torch.cat([timesteps, timesteps, timesteps], dim=0)
+            # energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+            
+            # # Compute noise contrastive energy loss
+            # energy_real, energy_collision, energy_collision_free = torch.chunk(energy, 3, 0)
+            # energy_stack = torch.cat([energy_real, energy_collision], dim=-1)
+            # energy_stack_cf = torch.cat([energy_real, energy_collision_free], dim=-1)
+            # target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
             
             
             # target_cf = torch.zeros(energy_real.size(0)).to(energy_stack.device)
@@ -647,14 +649,15 @@ class EBMDiffusionModel(nn.Module):
             
             loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
             
-            loss_cf = F.cross_entropy(energy_stack_cf, target.long(), reduction='none')[:, None]
+            # loss_cf = F.cross_entropy(energy_stack_cf, target.long(), reduction='none')[:, None]
 
             loss_scale = 0.5
             non_coll_loss_scale = 0
+            abs_e_loss_scale = 0.01
             
-            loss = loss_mse + loss_scale * loss_energy + non_coll_loss_scale * loss_cf
+            loss = loss_mse + loss_scale * loss_energy # + abs_e_loss_scale * energy_real# + non_coll_loss_scale * loss_cf
 
-            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_cf.mean())
+            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
         else:
             loss = loss_mse
             return loss.mean(), (loss_mse.mean(), torch.tensor(-1), torch.tensor(-1))
@@ -680,6 +683,8 @@ class EBMWrapper(nn.Module):
             # x = x.sum(dim=[1, 2])  # [B]
         
         energy = out.pow(2).sum(dim=1).sum(dim=1)[:, None]
+        # energy = out.sum(dim=1).sum(dim=1)[:, None]
+        # energy = F.sigmoid(energy)
         
         if return_energy:
             return energy

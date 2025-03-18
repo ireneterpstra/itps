@@ -180,6 +180,15 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
         batch = self.normalize_targets(batch)
         loss, (loss_denoise, loss_energy, loss_opt) = self.diffusion.compute_loss_e(batch)
         return {"loss": loss, "sub_loss": (loss_denoise, loss_energy, loss_opt)}
+    
+    def forward_e_g(self, batch: dict[str, Tensor], e_batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Run the batch through the model and compute the loss for training or validation."""
+        batch = self.normalize_inputs(batch)
+        if len(self.expected_image_keys) > 0:
+            batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+        batch = self.normalize_targets(batch)
+        loss, (loss_denoise, loss_energy, loss_opt) = self.diffusion.compute_loss_e_g(batch, e_batch)
+        return {"loss": loss, "sub_loss": (loss_denoise, loss_energy, loss_opt)}
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -669,7 +678,120 @@ class EBMDiffusionModel(nn.Module):
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
+   
+   
+    def compute_loss_e_g(self, batch: dict[str, Tensor], e_batch: dict[str, Tensor]) -> Tensor:
+        """
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+
+            "action": (B, horizon, action_dim)
+            "action_is_pad": (B, horizon) 
+        }
+        """
+        # Input validation
+        assert set(batch).issuperset({"observation.state", "action"}) # "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
+        n_obs_steps = batch["observation.state"].shape[1]
+        horizon = batch["action"].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
         
+        global_cond = self._prepare_global_conditioning(batch)
+        e_global_cond = self._prepare_global_conditioning(e_batch)
+        
+        # Forward diffusion.
+        trajectory = batch["action"]
+        
+        # Sample noise to add to the trajectory.
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+        # Sample a random noising timestep for each item in the batch.
+        timesteps = torch.randint(
+            low=0,
+            high=self.noise_scheduler.config.num_train_timesteps,
+            size=(trajectory.shape[0],),
+            device=trajectory.device,
+        ).long()
+        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+
+        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
+        pred = self.model(noisy_trajectory, timesteps, global_cond=global_cond)
+
+        # Compute the loss.
+        # The target is either the original trajectory, or the noise.
+        if self.config.prediction_type == "epsilon":
+            print("prediction_type = eps")
+            target = eps
+        elif self.config.prediction_type == "sample": # rewiew diff between loss targets
+            print("prediction_type = action")
+            target = batch["action"]
+        else:
+            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
+        
+        loss = F.mse_loss(pred, target, reduction="none")
+
+        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
+        if self.config.do_mask_loss_for_padding:
+            if "action_is_pad" not in batch:
+                raise ValueError(
+                    "You need to provide 'action_is_pad' in the batch when "
+                    f"{self.config.do_mask_loss_for_padding=}."
+                )
+            in_episode_bound = ~batch["action_is_pad"]
+            loss = loss * in_episode_bound.unsqueeze(-1)
+    
+        loss = einops.reduce(loss, 'b ... -> b (...)', 'mean')
+        
+        loss = loss * extract(self.loss_weight, timesteps, loss.shape)
+        loss_mse = loss
+        
+        
+            
+        ## Energy shaping
+        energy = self.model(noisy_trajectory, timesteps, global_cond=e_global_cond, return_energy=True)
+        action_low = batch["action_low"]
+        action_high = batch["action_high"]
+        
+        noisy_action_low = self.noise_scheduler.add_noise(action_low, eps, timesteps)
+        noisy_action_high = self.noise_scheduler.add_noise(action_high, eps, timesteps)
+        
+        # Compute energy of both distributions
+        global_cond_concat = torch.cat([e_global_cond, e_global_cond], dim=0)
+        traj_concat = torch.cat([noisy_action_low, noisy_action_high], dim=0)
+        # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+        t_concat = torch.cat([timesteps, timesteps], dim=0)
+        energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+        
+        # Compute noise contrastive energy loss
+        energy_low, energy_high = torch.chunk(energy, 2, 0)
+        energy_stack = torch.cat([energy_low, energy_high], dim=-1)
+        # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
+        target = torch.zeros(energy_low.size(0)).to(energy_stack.device)
+        loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+        
+        # loss_energy = 0
+        # for l in range(energy_low.size(0)): 
+        #     for h in range(energy_high.size(0)): 
+        #         energy_stack = torch.cat([energy_low[l:l+1], energy_high[h:h+1]], dim=-1)
+        #         # print("energy_stack", energy_stack)
+        #         # target = torch.zeros(energy_stack.size(0)).to(energy_stack.device)
+        #         loss_ep = -F.log_softmax(-1 * energy_stack, dim=1)
+        #         # loss_epc = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
+        #         # print("loss", loss_ep[0,0], loss_epc)
+        #         loss_energy += loss_ep[0, 0]    
+        
+        # print("loss enercgy", loss_energy)
+        loss_scale_e = 0.5 #0.0001
+        loss_scale_m = 1
+        loss = loss_scale_m * loss_mse + loss_scale_e * loss_energy # + 0.001 * loss_opt
+
+        return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
+     
     def compute_loss_e(self, batch: dict[str, Tensor]) -> Tensor:
         """
         This function expects `batch` to have:
@@ -742,11 +864,8 @@ class EBMDiffusionModel(nn.Module):
         # Energy shaping
         
         energy = self.model(noisy_trajectory, timesteps, global_cond=global_cond, return_energy=True)
-        e_choice = batch["e_choice"]
         action_low = batch["action_low"]
-        action_low_e = batch["action_low_e"]
         action_high = batch["action_high"]
-        action_high_e = batch["action_high_e"]
         
         noisy_action_low = self.noise_scheduler.add_noise(action_low, eps, timesteps)
         noisy_action_high = self.noise_scheduler.add_noise(action_high, eps, timesteps)
@@ -777,8 +896,8 @@ class EBMDiffusionModel(nn.Module):
         #         loss_energy += loss_ep[0, 0]    
         
         # print("loss enercgy", loss_energy)
-        loss_scale_e = 1 #0.0001
-        loss_scale_m = 0.1
+        loss_scale_e = 0.5 #0.0001
+        loss_scale_m = 1
         loss = loss_scale_m * loss_mse + loss_scale_e * loss_energy # + 0.001 * loss_opt
 
         return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))

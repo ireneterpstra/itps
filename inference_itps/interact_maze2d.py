@@ -1178,23 +1178,23 @@ if __name__ == "__main__":
         alignment_strategy = 'stochastic-sampling'
 
     if args.policy in ["diffusion", "dp"]:
-        checkpoint_path = 'weights_dp'
+        checkpoint_path = 'weights/weights_dp'
     elif args.policy in ["dp_ebm"]:
-        checkpoint_path = 'weights_maze2d_energy_dp_100k'
+        checkpoint_path = 'weights/weights_maze2d_energy_dp_100k'
     elif args.policy in ["dp_ebm_n"]:
-        checkpoint_path = 'weights_maze2d_dp_ebm_p_noise_100k'
+        checkpoint_path = 'weights/weights_maze2d_dp_ebm_p_noise_100k'
     elif args.policy in ["dp_ebm_p"]:
-        checkpoint_path = 'weights_maze2d_dp_ebm_pert_100k'
+        checkpoint_path = 'weights/weights_maze2d_dp_ebm_pert_100k'
     elif args.policy in ["dp_ebm_hp"]:
-        checkpoint_path = 'weights_maze2d_dp_ebm_half_pert_100k'
+        checkpoint_path = 'weights/weights_maze2d_dp_ebm_half_pert_100k'
     elif args.policy in ["dp_ebm_c"]:
-        checkpoint_path = 'weights_maze2d_conf_coll_100k'
+        checkpoint_path = 'weights/weights_maze2d_conf_coll_100k'
     elif args.policy in ["dp_ebm_c1"]:
-        checkpoint_path = 'weights_maze2d_conf_coll_0.1_100k'
+        checkpoint_path = 'weights/weights_maze2d_conf_coll_0.1_100k'
     elif args.policy in ["dp_ebm_c3"]:
-        checkpoint_path = 'weights_maze2d_conf_coll_0.3_100k'
+        checkpoint_path = 'weights/weights_maze2d_conf_coll_0.3_100k'
     elif args.policy in ["act"]:
-        checkpoint_path = 'weights_act'
+        checkpoint_path = 'weights/weights_act'
     else:
         raise NotImplementedError(f"Policy with name {args.policy} is not implemented.")
 
