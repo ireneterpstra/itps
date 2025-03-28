@@ -113,9 +113,10 @@ class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
 
         actions = self.unnormalize_outputs({"action": actions})["action"]
         
+        # print("called run_inference with return_energy =", return_energy)
         if return_energy: 
             return actions, energy
-
+        # print("returning", actions)
         return actions
     
     def sample_perturbed_actions(self, observation_batch: dict[str, Tensor], mag_mul=0.5 , guide: Tensor | None = None, visualizer=None):
@@ -702,6 +703,10 @@ class EBMDiffusionModel(nn.Module):
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
         
+        
+        # print("B", batch["action"].shape[0], batch["observation.state"].shape[0], batch["observation.environment_state"].shape[0])
+        # print("eB", e_batch["action"].shape[0], e_batch["observation.state"].shape[0], e_batch["observation.environment_state"].shape[0])
+        
         global_cond = self._prepare_global_conditioning(batch)
         e_global_cond = self._prepare_global_conditioning(e_batch)
         
@@ -725,10 +730,10 @@ class EBMDiffusionModel(nn.Module):
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
         if self.config.prediction_type == "epsilon":
-            print("prediction_type = eps")
+            # print("prediction_type = eps")
             target = eps
         elif self.config.prediction_type == "sample": # rewiew diff between loss targets
-            print("prediction_type = action")
+            # print("prediction_type = action")
             target = batch["action"]
         else:
             raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
@@ -751,11 +756,39 @@ class EBMDiffusionModel(nn.Module):
         loss_mse = loss
         
         
-            
         ## Energy shaping
-        energy = self.model(noisy_trajectory, timesteps, global_cond=e_global_cond, return_energy=True)
-        action_low = batch["action_low"]
-        action_high = batch["action_high"]
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+        data_sample = self.noise_scheduler.add_noise(trajectory, eps, timesteps) # self.q_sample(x_start = x_start, t = t, noise = noise)
+        
+        # Curruption Function: construct a set of negative labels that bring the energy landscape up around positive points
+        xmin_noise = self.noise_scheduler.add_noise(trajectory, 3.0 * eps, timesteps) #self.q_sample(x_start = x_start, t = t, noise = noise)
+        
+        
+        loss_scale = 0.5
+        
+        # Compute energy of both distributions
+        global_cond_concat = torch.cat([global_cond, global_cond], dim=0)
+        traj_concat = torch.cat([data_sample, xmin_noise], dim=0)
+        # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
+        t_concat = torch.cat([timesteps, timesteps], dim=0)
+        energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+
+
+        # Compute noise contrastive energy loss
+        energy_real, energy_fake = torch.chunk(energy, 2, 0)
+        energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
+        # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
+        target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
+        loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+        
+        # loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
+
+        # return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
+    
+            
+        ## Push action low
+        action_low = e_batch["action_low"]
+        action_high = e_batch["action_high"]
         
         noisy_action_low = self.noise_scheduler.add_noise(action_low, eps, timesteps)
         noisy_action_high = self.noise_scheduler.add_noise(action_high, eps, timesteps)
@@ -765,32 +798,24 @@ class EBMDiffusionModel(nn.Module):
         traj_concat = torch.cat([noisy_action_low, noisy_action_high], dim=0)
         # traj_concat = torch.cat([xmin, xmin_noise_min], dim=0)
         t_concat = torch.cat([timesteps, timesteps], dim=0)
-        energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
+        p_energy = self.model(traj_concat, t_concat, global_cond=global_cond_concat, return_energy=True)
         
         # Compute noise contrastive energy loss
-        energy_low, energy_high = torch.chunk(energy, 2, 0)
+        energy_low, energy_high = torch.chunk(p_energy, 2, 0)
         energy_stack = torch.cat([energy_low, energy_high], dim=-1)
         # energy_stack = torch.stack([energy_real, energy_fake], dim=-1)
         target = torch.zeros(energy_low.size(0)).to(energy_stack.device)
-        loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+        loss_p_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
         
-        # loss_energy = 0
-        # for l in range(energy_low.size(0)): 
-        #     for h in range(energy_high.size(0)): 
-        #         energy_stack = torch.cat([energy_low[l:l+1], energy_high[h:h+1]], dim=-1)
-        #         # print("energy_stack", energy_stack)
-        #         # target = torch.zeros(energy_stack.size(0)).to(energy_stack.device)
-        #         loss_ep = -F.log_softmax(-1 * energy_stack, dim=1)
-        #         # loss_epc = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
-        #         # print("loss", loss_ep[0,0], loss_epc)
-        #         loss_energy += loss_ep[0, 0]    
-        
-        # print("loss enercgy", loss_energy)
-        loss_scale_e = 0.5 #0.0001
-        loss_scale_m = 1
-        loss = loss_scale_m * loss_mse + loss_scale_e * loss_energy # + 0.001 * loss_opt
+        loss_scale_p = 1
+        loss_scale_e = 0.05 #0.0001
+        loss_scale_m = 0.1
+        loss = loss_scale_m * loss_mse + loss_scale_e * loss_energy + loss_scale_p * loss_p_energy
 
-        return loss.mean(), (loss_mse.mean(), loss_energy.mean(), torch.tensor(-1))
+        # train w/o collision preference
+        # train w 50-100 drwaings for new diffusion model 
+            
+        return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_p_energy.mean())
      
     def compute_loss_e(self, batch: dict[str, Tensor]) -> Tensor:
         """

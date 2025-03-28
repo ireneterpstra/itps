@@ -68,6 +68,9 @@ from common.logger import Logger, log_output_dir
 from common.datasets.factory import make_dataset
 from common.utils.path_utils import perturb_traj, generate_trajs
 from scipy.special import softmax
+
+from scritps.tune import TunePolicy
+
 import time
 import json
 
@@ -321,6 +324,54 @@ class MazeEnv:
         samples = samples[sort_idx]
         scores = scores[sort_idx]  
         return samples, scores
+    
+    def imshow3d(self, ax, array, value_direction='z', pos=0, norm=None, cmap=None):
+        """
+        Display a 2D array as a  color-coded 2D image embedded in 3d.
+
+        The image will be in a plane perpendicular to the coordinate axis *value_direction*.
+
+        Parameters
+        ----------
+        ax : Axes3D
+            The 3D Axes to plot into.
+        array : 2D numpy array
+            The image values.
+        value_direction : {'x', 'y', 'z'}
+            The axis normal to the image plane.
+        pos : float
+            The numeric value on the *value_direction* axis at which the image plane is
+            located.
+        norm : `~matplotlib.colors.Normalize`, default: Normalize
+            The normalization method used to scale scalar data. See `imshow()`.
+        cmap : str or `~matplotlib.colors.Colormap`, default: :rc:`image.cmap`
+            The Colormap instance or registered colormap name used to map scalar data
+            to colors.
+        """
+        if norm is None:
+            norm = Normalize()
+        colors = plt.get_cmap(cmap)(norm(array))
+
+        if value_direction == 'x':
+            nz, ny = array.shape
+            zi, yi = np.mgrid[0:nz + 1, 0:ny + 1]
+            xi = np.full_like(yi, pos)
+        elif value_direction == 'y':
+            nx, nz = array.shape
+            xi, zi = np.mgrid[0:nx + 1, 0:nz + 1]
+            yi = np.full_like(zi, pos)
+        elif value_direction == 'z':
+            ny, nx = array.shape
+            yi, xi = np.mgrid[0:ny + 1, 0:nx + 1]
+            zi = np.full_like(xi, pos)
+        else:
+            raise ValueError(f"Invalid value_direction: {value_direction!r}")
+
+        xi = xi - 0.5
+        yi = yi - 0.5
+
+        ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.5)
+
     
     
 class CollisionMapper:
@@ -581,57 +632,6 @@ class UnconditionalMazeTopo(MazeEnv):
             # print(a_out.shape, e_out.shape, abl_out.shape, abl_energies.shape)
             return a_out, e_out, abl_out, abl_energies
 
-
-    def imshow3d(self, ax, array, value_direction='z', pos=0, norm=None, cmap=None):
-        """
-        Display a 2D array as a  color-coded 2D image embedded in 3d.
-
-        The image will be in a plane perpendicular to the coordinate axis *value_direction*.
-
-        Parameters
-        ----------
-        ax : Axes3D
-            The 3D Axes to plot into.
-        array : 2D numpy array
-            The image values.
-        value_direction : {'x', 'y', 'z'}
-            The axis normal to the image plane.
-        pos : float
-            The numeric value on the *value_direction* axis at which the image plane is
-            located.
-        norm : `~matplotlib.colors.Normalize`, default: Normalize
-            The normalization method used to scale scalar data. See `imshow()`.
-        cmap : str or `~matplotlib.colors.Colormap`, default: :rc:`image.cmap`
-            The Colormap instance or registered colormap name used to map scalar data
-            to colors.
-        """
-        if norm is None:
-            norm = Normalize()
-        colors = plt.get_cmap(cmap)(norm(array))
-
-        if value_direction == 'x':
-            nz, ny = array.shape
-            zi, yi = np.mgrid[0:nz + 1, 0:ny + 1]
-            xi = np.full_like(yi, pos)
-        elif value_direction == 'y':
-            nx, nz = array.shape
-            xi, zi = np.mgrid[0:nx + 1, 0:nz + 1]
-            yi = np.full_like(zi, pos)
-        elif value_direction == 'z':
-            ny, nx = array.shape
-            yi, xi = np.mgrid[0:ny + 1, 0:nx + 1]
-            zi = np.full_like(xi, pos)
-        else:
-            raise ValueError(f"Invalid value_direction: {value_direction!r}")
-        # xi = self.gui2x(xi)
-        # yi = self.gui2y(yi)
-        xi = xi - 0.5
-        yi = yi - 0.5
-        # print(xi)
-        # print(yi)
-        # print(zi)
-        ax.plot_surface(xi, yi, zi, rstride=1, cstride=1, facecolors=colors, shade=False, alpha=0.5)
-
     def plot_energies(self, xy, energies, num_inc=1, collisions=None, name=""):
         num_traj = int(len(energies)/(num_inc + 1))
         if collisions is None:
@@ -717,7 +717,7 @@ class UnconditionalMazeTopo(MazeEnv):
         if self.agent_in_collision:
             self.agent_color = self.blend_with_white(self.RED, 0.8)
         else:
-            self.agent_color = self.RED        
+            self.agent_color = self.RED
         self.agent_history_xy.append(agent_xy_pos)
         self.agent_history_xy = self.agent_history_xy[-history_len:]
         
@@ -816,7 +816,8 @@ class UnconditionalMaze(MazeEnv):
         if self.agent_in_collision:
             self.agent_color = self.blend_with_white(self.RED, 0.8)
         else:
-            self.agent_color = self.RED        
+            self.agent_color = self.RED   
+        # print("agent_xy_pos", agent_xy_pos)     
         self.agent_history_xy.append(agent_xy_pos)
         self.agent_history_xy = self.agent_history_xy[-history_len:]
 
@@ -857,25 +858,11 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         self.finetune = False
         self.picking_start_pos = True
         
-        #Training Params
-        self.use_amp=False
-        self.lr = 1.0e-6
-        self.adam_betas = [0.95, 0.999]
-        self.adam_eps = 1.0e-8
-        self.adam_weight_decay = 1.0e-6
-        # self.lr_scheduler
-        # self.lr_warmup_steps
-        self.grad_clip_norm = 10
+        self.max_e = -np.inf
+        self.min_e = np.inf
         
-        self.optimizer = torch.optim.Adam(
-            self.policy.diffusion.parameters(),
-            self.lr,
-            self.adam_betas,
-            self.adam_eps,
-            self.adam_weight_decay,
-        )
         
-        self.grad_scaler = GradScaler(enabled=self.use_amp)
+        self.tuner = TunePolicy(policy)
         
         # self.coll_mapper = CollisionMapper(self.policy, self, policy_tag="tuned_" + self.policy_tag)
         
@@ -883,6 +870,7 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         
     def gen_obs_batch(self):
         agent_hist_xy = self.agent_history_xy[-1] 
+        # print("gen obs agent_hist_xy", agent_hist_xy)
         agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
         if self.policy_tag[:2] == 'dp':
             agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
@@ -895,148 +883,20 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         obs_batch["observation.environment_state"] = einops.repeat(
             torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
         )
+        # print("obs_batch 0", obs_batch["observation.state"][-1][0])
         return obs_batch
         
         
-    def tune_model(self, guide):
-        guide = torch.from_numpy(guide).float().cuda()
-        
-        action_i = torch.from_numpy(self.xy_pred).float().cuda()
-        action = torch.cat((action_i, action_i[:, -1:, :]), 1)
-        energy = torch.from_numpy(self.energy).float().cuda()
-        # self.energy
-        print("action shape", action.size())
-        
-        
-        # find path closest to guide
-        #TODO: Pick 
-        assert action.shape[2] == 2 and guide.shape[1] == 2
-        indices = torch.linspace(0, guide.shape[0]-1, action.shape[1], dtype=int)
-        guide = torch.unsqueeze(guide[indices], dim=0)
-        dist = torch.linalg.norm(action - guide, dim=2, ord=2) # (B, pred_horizon)
-        dist = dist.mean(dim=1)
-        idx_sort = torch.argsort(dist, dim=0)
-        print("idx_sort", idx_sort, dist[idx_sort]-min(dist))
-        # return
-        dist_mask_idx = torch.where(dist[idx_sort]-min(dist) < 0.25, 1, 0)
-        # if torch.min(dist) > 0.5: 
-        #     #TODO: pick closest anyways
-        #     raise ValueError(f"Guide not close to any paths {torch.min(dist)}")
-        # # TODO: Throw error if all paths are high
-        # dist_mask = torch.where(dist < 0.5, 1, 0)
-        # dist_p = dist[dist_mask.bool()]
-        # idx = torch.nonzero(torch.sum(dist_mask, 1)).squeeze()
-        # nidx = torch.where(torch.sum(dist_mask, 1) == 0)[0]
-        
-        idx = idx_sort[dist_mask_idx.bool()]
-        nidx = idx_sort[~dist_mask_idx.bool()]
-        print("close e path", idx)
-        print("far / low e path", nidx)
-        # return
-        
-        # make energies that match that guide 
-        e_choice = torch.zeros(energy.size(0)).to(energy.device)
-        e_choice[idx] = 1
-
-        # gen batch
-        batch = self.obs_batch
-        
-        batch["action"] = action
-        batch["energy"] = energy
-        batch["e_choice"] = e_choice
-        
-        # print(self.policy)
-        # for name, layer in self.policy.diffusion.unet.named_children():
-        #     print(name)
-        #     if name in ['diffusion_step_encoder', 'down_modules', 'mid_modules']:
-        #         print("turning off", name)
-        #         for param in layer.parameters():
-        #             param.requires_grad = False
-                    
-        for param in self.policy.diffusion.unet.diffusion_step_encoder.parameters():
-            param.requires_grad = False
-        for param in self.policy.diffusion.unet.down_modules.parameters():
-            param.requires_grad = False
-        for param in self.policy.diffusion.unet.mid_modules.parameters():
-            param.requires_grad = False
-        # for param in self.policy.diffusion.unet.up_modules.parameters():
-        #     param.requires_grad = False
-        for name, param in  self.policy.named_parameters():
-            if param.requires_grad:
-                print(f"Trainable layer: {name}")
-    
-        
-        
-        # iterate untill model converges or max itter reached
-        max_steps = 300
-        for s in range(max_steps): 
-            #Shuffle batch
-            action_low = action.clone()
-            action_low_e = energy.clone()
-            action_high = action.clone()
-            action_high_e = energy.clone()
-            
-            for i in range(action.shape[0]):
-                # pick random low index
-                low_idx = idx[torch.randint(len(idx), (1,))]
-                high_idx = nidx[torch.randint(len(nidx), (1,))]
-                action_low[i] = action[low_idx]
-                action_low_e[i] = energy[low_idx]
-                action_high[i] = action[high_idx]
-                action_high_e[i] = energy[high_idx]
-                
-            batch = self.obs_batch
-            
-            perm_a = action.clone()
-        
-            batch["action"] = perm_a[torch.randperm(perm_a.shape[0])]
-            batch["energy"] = energy
-            batch["e_choice"] = e_choice
-            batch["action_low"] = action_low
-            batch["action_low_e"] = action_low_e
-            batch["action_high"] = action_high
-            batch["action_high_e"] = action_high_e
-            ###
-            
-            train_info = update_policy_e(
-                self.policy,
-                batch,
-                self.optimizer,
-                self.grad_clip_norm,
-                s, 
-                grad_scaler=self.grad_scaler,
-                use_amp=self.use_amp,
-            )
-            action_energy = self.policy.get_energy(action_i, copy.deepcopy(self.obs_batch))
-            energy_low = action_energy[e_choice.bool()]
-            energy_high = action_energy[~e_choice.bool()]
-            if s > 4: 
-            
-                if min(energy_low) < min(energy_high): 
-                    print("policy converged, steps:", s, max(energy_low), min(energy_high))
-                    print("policy converged, steps:", s, energy_low, energy_high)
-                    break
-            print("policy not converged", max(energy_low), min(energy_high))
-            
-        # I dont want an energy map I want to plot energies of my paths
-        # coll_mapper = CollisionMapper(self.policy, self, policy_tag="tuned_" + self.policy_tag)
-        # coll_mapper.generate_collision_map()
-            
-        # logger.save_checkpont(
-        #     step,
-        #     policy,
-        #     optimizer,
-        #     lr_scheduler,
-        #     identifier=step_identifier,
-        # )
-
-        # return info
-        return
-    
-    def generate_energy_color_map(self, energies):
+    def generate_energy_color_map(self, energies, global_range=False):
         num_es = len(energies)
+        
         cmap = plt.get_cmap('rainbow')
-        energies_norm = (energies-np.min(energies))/(np.max(energies)-np.min(energies))
+        if global_range: 
+            energies_norm = (energies-self.min_e)/(self.max_e-self.min_e)
+        else: 
+            energies_norm = (energies-np.min(energies))/(np.max(energies)-np.min(energies))
+        # energisces_norm = (energies-self.min_e)/(self.max_e-self.min_e)
+
         # print("min norm", np.argmin(energies_norm))
         # values = np.linspace(0, 1, num_es)
         # print("min - max energies", np.min(energies), np.max(energies))
@@ -1091,10 +951,102 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         obs_batch = self.gen_obs_batch()
 
         with torch.autocast(device_type="cuda"), seeded_context(0):
-            actions, energy = self.policy.run_inference(obs_batch, guide=guide, return_energy=True) # directly call the policy in order to visualize the intermediate steps
+            actions, energy = self.policy.run_inference(copy.deepcopy(obs_batch), guide=guide, return_energy=True) # directly call the policy in order to visualize the intermediate steps
             actions = actions.detach().cpu().numpy()
             energy = energy.detach().cpu().numpy()
         return actions, energy, obs_batch
+    
+    def plot_paths(self, xy, energies, save_path="", start_loc=None, guide_loc=None, dpi=150, ):
+        X = xy[:, :, 0]
+        Y = xy[:, :, 1]
+        
+        energies = einops.rearrange(energies, "n 1 -> 1 n")
+        energy_colors = self.generate_energy_color_map(energies.squeeze())
+        energy_colors_glob = self.generate_energy_color_map(energies.squeeze(), global_range=True)
+        # print(xy.shape)
+        # print(energies.shape)
+        # print(energy_colors.shape)
+        Z = np.repeat(energies.T, xy.shape[1], axis=1)
+        
+        maze = np.swapaxes(self.maze, 0, 1)
+        
+        
+        
+        # Plot flat 
+        fig, ax = plt.subplots(1, 2, figsize=(15, 9))
+        im0 = ax[0].imshow(maze, cmap='binary')
+        im1 = ax[1].imshow(maze, cmap='binary')
+        # self.imshow3d(ax[0], maze, cmap="binary")
+        # self.imshow3d(ax[1], maze, cmap="binary")
+        
+        for i in range(int(xy.shape[0])):
+            # color = (energy_colors[i, :3] * 255).astype(int)
+            color = energy_colors[i, :3]
+            color_g = energy_colors_glob[i, :3]
+            # print(color.shape)
+            ax[0].plot(X[i], Y[i], color=color)
+            ax[0].scatter(X[i], Y[i], c=color, s=5)
+            ax[1].plot(X[i], Y[i], color=color_g)
+            ax[1].scatter(X[i], Y[i], c=color_g, s=5)
+            
+            
+            
+        fig.suptitle(f'Energy Path Map {self.policy_tag} {start_loc},{guide_loc}', fontsize=14)
+        
+        ax[0].set_title("Batch Scale", fontsize=10)
+        ax[1].set_title("Global Scale", fontsize=10)
+        
+        norm = plt.Normalize(energies.min(), energies.max())
+        # cax = fig.add_axes([0.94, 0.1, 0.05, 0.75])  # [left, bottom, width 5% of figure width, height 75% of figure height]
+        # cax.set_title('RF regret')
+        fig.colorbar(cm.ScalarMappable(norm=norm, cmap='rainbow'), ax=ax[0], orientation='vertical', shrink=0.7)
+        
+        norm = plt.Normalize(self.min_e, self.max_e)
+        fig.colorbar(cm.ScalarMappable(norm=norm, cmap='rainbow'), ax=ax[1], orientation='vertical', shrink=0.7)
+
+        
+        if start_loc is not None: 
+            ax[0].plot(start_loc[0], start_loc[1], color="deeppink", markersize=30, marker="P")
+            ax[1].plot(start_loc[0], start_loc[1], color="fuchsia", markersize=30, marker="P")
+            
+        if guide_loc is not None: 
+            ax[0].plot(guide_loc[0], guide_loc[1], color="lime", markersize=30, marker="X")
+            ax[1].plot(guide_loc[0], guide_loc[1], color="springgreen", markersize=30, marker="X")
+        
+        
+        plt.tight_layout()
+        
+        plt.savefig(f"{save_path}_energy_path_map_{self.policy_tag}.png", dpi=dpi)
+        
+        # plt.show()
+        
+        
+        plt.clf()
+        plt.close('all')
+        
+        
+        
+        # Plot 3D
+        # fig2 = plt.figure()
+        # ax2 = fig2.add_subplot(projection='3d')
+        
+        # self.imshow3d(ax2, maze, cmap="binary")
+
+        # for i in range(int(xy.shape[0])):
+        #     # color = (energy_colors[i, :3] * 255).astype(int)
+        #     color = energy_colors[i, :3]
+        #     print(color.shape)
+        #     ax2.plot(X[i], Y[i], Z[i], color=color)
+        #     ax2.scatter(X[i], Y[i], Z[i], c=color, s=5)
+        
+        # plt.show()
+        
+        # plt.clf()
+        # plt.close('all')
+        
+    def update_global_energy(self):
+        self.max_e = max(max(self.energy), self.max_e)
+        self.min_e = min(min(self.energy), self.min_e)
 
     def run(self):
         '''
@@ -1127,14 +1079,27 @@ class FinetuneEnergyMaze(UnconditionalMaze):
             self.savefile = open(self.savepath, "a+", buffering=1)
             self.trial_idx = 0
 
-        mouse_pos = [[640, 730], [650, 550], [1050, 150], [630, 150], [860, 340]]
-        i = np.random.randint(len(mouse_pos))
-        self.start_loc = mouse_pos[i]
+        key_points = [
+            #row 1
+            [165, 155], [445, 150], [645, 160], [860, 155], [1045, 155],
+            #row 2
+            [160, 340], [445, 335], [640, 355], [860, 340], [1045, 330],
+            #row 3
+            [150, 540], [245, 560], [445, 560], [645, 550], [840, 550], [1045, 550],
+            #row 4
+            [150, 750], [245, 745], [445, 760], [645, 740], [840, 730], [1045, 750],
+            ]
+        start_loc = key_points[np.random.randint(len(key_points))]
+        guide_loc = key_points[np.random.randint(len(key_points))]
 
+        # start_loc = self.mouse_pos.copy()
+        start_loc = [640, 730]
+        # guide_loc = [640, 730]
         while self.running:
             self.update_mouse_pos()
+            # print(self.mouse_pos)
             # print("start pos", self.start_loc)
-            
+            # print("curr obs batch", self.obs_batch["observation.state"][-1][0])
 
             # Handle events
             for event in pygame.event.get():
@@ -1157,6 +1122,9 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                         self.draw_traj = [] 
                         if self.savepath is not None:
                             self.save_trials()
+                    if event.key == pygame.K_p:
+                        start_loc_p = self.agent_history_xy[-1]
+                        self.plot_paths(self.xy_pred, self.energy, tag=f"p_({start_loc_p[0]},{start_loc_p[1]})", start_loc=start_loc_p)
                 if self.drawmode: 
                     if any(pygame.mouse.get_pressed()):  # Check if mouse button is pressed
                         if not self.drawing:
@@ -1169,26 +1137,38 @@ class FinetuneEnergyMaze(UnconditionalMaze):
                             self.keep_drawing = True # keep visualizing the drawing    
                             self.finetune = True                        
             if self.finetune: 
+                # print("finetune")
                 if len(self.draw_traj) > 0:
                     guide = np.array([self.gui2xy(point) for point in self.draw_traj])
-                    self.tune_model(guide)
+                    guide_f = guide[-1]
+                    # self.tuner.tune_energy_with_guide(self.xy_pred, self.energy, guide, self.obs_batch)
+                    # print("obs plugged in", self.obs_batch["observation.state"][-1][0])
+                    start_loc_h = self.agent_history_xy[-1]
+                    self.plot_paths(self.xy_pred, self.energy, tag=f"start_({start_loc_h[0]},{start_loc_h[1]})", start_loc=start_loc_h)
+                    self.xy_pred, self.energy = self.tuner.tune_energy(self.xy_pred, guide, self.obs_batch)
+                    self.update_global_energy()
+                    
+                    self.plot_paths(self.xy_pred, self.energy, tag=f"tuned_400_({start_loc_h[0]},{start_loc_h[0]})_({guide_f[0]},{guide_f[1]})", start_loc=start_loc_h, guide_loc=guide_f)
                 else: 
                     raise RuntimeError("No guidance found")
                 self.finetune = False
                 
             elif not self.drawing and not self.drawmode: # inference mode
+                # print("inference")
                 if not self.keep_drawing:
                     if self.picking_start_pos: 
-                        self.start_loc = self.mouse_pos.copy()
-                    self.update_agent_pos(self.start_loc.copy())
+                        start_loc = self.mouse_pos.copy()
+                    self.update_agent_pos(start_loc.copy())
                 if len(self.draw_traj) > 0:
                     raise RuntimeError("Should be in tuning state")
                 else:
                     guide = None
                 self.xy_pred, self.energy, self.obs_batch = self.infer_target()
-
+                self.update_global_energy()
+                
                 self.collisions = self.check_collision(self.xy_pred)
 
+            print("Glob max min e", self.max_e, self.min_e)
             self.update_screen_energy(self.xy_pred, self.energy, self.collisions, (self.keep_drawing or self.drawing))
             # if self.vis_dp_dynamics and not self.drawing and self.keep_drawing:
             #     time.sleep(1)
@@ -1211,7 +1191,120 @@ class FinetuneEnergyMaze(UnconditionalMaze):
         self.savefile.write(json.dumps(entry) + "\n")
         print(f"Trial {self.trial_idx} saved to {self.savepath}.")
         self.trial_idx += 1
+        
+class TestFinetuneEnergyMaze(FinetuneEnergyMaze):
+    def __init__(self, policy, pretrained_policy_path, savepath=None, policy_tag=None):
+        super().__init__(policy, policy_tag=policy_tag)
+        self.drawing = False
+        self.keep_drawing = False
+        #Add back in vis if neccesary
+        # self.vis_dp_dynamics = vis_dp_dynamics
+        self.savefile = None
+        self.savepath = savepath 
+        self.draw_traj = [] # gui coordinates
+        self.xy_pred = None # numpy array
+        self.collisions = None # boolean array
+        self.scores = None # numpy array
+        # self.alignment_strategy = alignment_strategy
+        self.drawmode = False
+        self.finetune = False
+        self.picking_start_pos = True
+        self.pretrained_policy_path = pretrained_policy_path
+        
+        self.max_e = -np.inf
+        self.min_e = np.inf
+        
+        
+        # self.tuner = TunePolicy(policy)
+        
+    def reset_policy(self): 
+        alignment_strategy = 'post-hoc'
+        policy = DiffusionPolicy.from_pretrained(self.pretrained_policy_path, alignment_strategy=alignment_strategy)
+        policy.config.noise_scheduler_type = "DDIM"
+        policy.diffusion.num_inference_steps = 10
+        policy.config.n_action_steps = policy.config.horizon - policy.config.n_obs_steps + 1
+        policy_tag = 'dp_ebm'
+        policy_tag_a = args.policy
+        policy.cuda()
+        policy.eval()
+        self.policy = policy
+        self.tuner.reset_policy(self.policy)
+        
+        
+    def run(self):
+        '''
+        States: 
+            inference 
+            drawing
+            tuning
+        
+        1. select start location
+            press key "c"
+                enter drawmode
+            
+        2. select preferred path
+            (future note maybe hilight closest path)
+            start drawing with mouse down
+            press key "f" to finish
+                end drawmode
+                eneter finetune
+            
+        3. fine tune model with low energy at preferred path
+            3.a find paths closest to user preference
+            3.b save paths + energies to dataset
+            3.c fine tune model with new data
+            
+            press key "r" to reset ??
+                
+        
+        '''
+        
 
+        key_points = np.array([
+            #row 1
+            [165, 155], [445, 150], [645, 160], [860, 155], [1045, 155],
+            #row 2
+            [160, 340], [445, 335], [640, 355], [860, 340], [1045, 330],
+            #row 3
+            [150, 540], [245, 560], [445, 560], [645, 550], [840, 550], [1045, 550],
+            #row 4
+            [150, 750], [245, 745], [445, 760], [645, 740], [840, 730], [1045, 750],
+            ])
+        
+        # for i in range(len(key_points)): 
+        #     for j in range(len(key_points)):
+        s = 4 # np.random.randint(len(key_points))
+        g = 14 # np.random.randint(len(key_points))
+        if s == g: 
+            pass
+        else: 
+            start_loc = key_points[s]
+            self.update_agent_pos(start_loc)
+            guide_loc = key_points[g]
+            
+            start_xy_pos = np.round(self.gui2xy(start_loc), 2)
+            guide_xy_pos = np.round(self.gui2xy(guide_loc), 2)
+            
+            guide = einops.repeat(guide_loc, "n -> t n", t=2)
+            guide = np.array([self.gui2xy(point) for point in guide])
+            
+            pos_string = f"tune_plots/{self.policy_tag}_tune_plots_4000_s2/{s}_{g}_({start_xy_pos[0]},{start_xy_pos[1]})_({guide_xy_pos[0]},{guide_xy_pos[1]})/"
+            os.makedirs(pos_string, exist_ok = True)
+
+            self.xy_pred, self.energy, self.obs_batch = self.infer_target()
+            self.update_global_energy()
+            self.plot_paths(self.xy_pred, self.energy, save_path=pos_string + "start", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+            
+            self.xy_pred, self.energy, steps = self.tuner.tune_energy(self.xy_pred, guide, self.obs_batch)
+            self.update_global_energy()
+            self.plot_paths(self.xy_pred, self.energy, save_path= pos_string + f"fit_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+
+            self.xy_pred, self.energy, self.obs_batch = self.infer_target()
+            self.update_global_energy()
+            self.plot_paths(self.xy_pred, self.energy, save_path=pos_string + f"tuned_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+                
+                # self.reset_policy()
+        pygame.quit()
 
 class ConditionalMaze(UnconditionalMaze):
     # for interactive guidance dataset collection
@@ -1405,6 +1498,7 @@ if __name__ == "__main__":
     parser.add_argument('-u', '--unconditional', action='store_true', help="Unconditional Maze")
     parser.add_argument('-ut', '--topo', action='store_true', help="Unconditional Topo Maze")
     parser.add_argument('-eg', '--energy-guide', action='store_true', help="Guide with Energy")
+    parser.add_argument('-tt', '--test-tune', action='store_true', help="Test Tune with Energy")
     parser.add_argument('-op', '--output-perturb', action='store_true', help="Output perturbation")
     parser.add_argument('-ph', '--post-hoc', action='store_true', help="Post-hoc ranking")
     parser.add_argument('-bi', '--biased-initialization', action='store_true', help="Biased initialization")
@@ -1432,23 +1526,25 @@ if __name__ == "__main__":
         alignment_strategy = 'stochastic-sampling'
 
     if args.policy in ["diffusion", "dp"]:
-        checkpoint_path = 'weights_dp'
+        checkpoint_path = 'weights/weights_dp'
     elif args.policy in ["dp_ebm"]:
-        checkpoint_path = 'weights_maze2d_energy_dp_100k'
+        checkpoint_path = 'weights/weights_maze2d_energy_dp_100k'
     elif args.policy in ["dp_ebm_n"]:
-        checkpoint_path = 'weights_maze2d_dp_ebm_p_noise_100k'
+        checkpoint_path = 'weights/weights_maze2d_dp_ebm_p_noise_100k'
     elif args.policy in ["dp_ebm_p"]:
-        checkpoint_path = 'weights_maze2d_dp_ebm_pert_100k'
+        checkpoint_path = 'weights/weights_maze2d_dp_ebm_pert_100k'
     elif args.policy in ["dp_ebm_hp"]:
-        checkpoint_path = 'weights_maze2d_dp_ebm_half_pert_100k'
+        checkpoint_path = 'weights/weights_maze2d_dp_ebm_half_pert_100k'
     elif args.policy in ["dp_ebm_c"]:
-        checkpoint_path = 'weights_maze2d_conf_coll_100k'
+        checkpoint_path = 'weights/weights_maze2d_conf_coll_100k'
     elif args.policy in ["dp_ebm_c1"]:
-        checkpoint_path = 'weights_maze2d_conf_coll_0.1_100k'
+        checkpoint_path = 'weights/weights_maze2d_conf_coll_0.1_100k'
     elif args.policy in ["dp_ebm_c3"]:
-        checkpoint_path = 'weights_maze2d_conf_coll_0.3_100k'
+        checkpoint_path = 'weights/weights_maze2d_conf_coll_0.3_100k'
+    elif args.policy in ["dp_no_cont"]:
+        checkpoint_path = 'weights/weights_maze2d_dp_no_contrast1_100k'
     elif args.policy in ["act"]:
-        checkpoint_path = 'weights_act'
+        checkpoint_path = 'weights/weights_act'
     else:
         raise NotImplementedError(f"Policy with name {args.policy} is not implemented.")
 
@@ -1465,7 +1561,7 @@ if __name__ == "__main__":
         policy_tag_a = 'dp'
         policy.cuda()
         policy.eval()
-    elif args.policy in ["dp_ebm", "dp_ebm_n", "dp_ebm_p", "dp_ebm_hp", "dp_ebm_c", "dp_ebm_c1", "dp_ebm_c3"]:
+    elif "dp" in args.policy:
         policy = DiffusionPolicy.from_pretrained(pretrained_policy_path, alignment_strategy=alignment_strategy)
         policy.config.noise_scheduler_type = "DDIM"
         policy.diffusion.num_inference_steps = 10
@@ -1507,6 +1603,9 @@ if __name__ == "__main__":
     elif args.energy_guide:
         print("eg")
         interactiveMaze = FinetuneEnergyMaze(policy, args.savepath, policy_tag=policy_tag)
+    elif args.test_tune:
+        print("tt")
+        interactiveMaze = TestFinetuneEnergyMaze(policy, pretrained_policy_path, args.savepath, policy_tag=policy_tag_a)
 
     else:
         interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag)

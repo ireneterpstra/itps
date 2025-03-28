@@ -1,7 +1,12 @@
-itps/common/*/__pycache__/
-itps/common/policies/*/__pycache__/
-inference_itps/common/datasets/__pycache__/
+itps/common/*/__pycache__
+itps/common/policies/*/__pycache__
+inference_itps/common/policies/*/__pycache__
+inference_itps/common/*/__pycache__
+*/__pycache__
 **/__pycache__
+***/__pycache__
+****/__pycache__
+*****/__pycache__
 itps/weights/weights_*/
 itps/weights/weights_*
 inference_itps/weights
@@ -18,3 +23,4 @@ data/*
 inference_itps/plots
 maze2d-large-sparse-v1.hdf5
 inference_itps/energy_coll_maps/
+inference_itps/tune_plots/
