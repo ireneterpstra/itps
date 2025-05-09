@@ -3,7 +3,7 @@ device: cuda:1
 use_amp: false
 seed: 100000
 dataset_repo_id: maze2d
-dataset_root: ../maze2d-large-sparse-v1.hdf5
+dataset_root: ./maze2d-large-sparse-v1.hdf5
 video_backend: pyav
 training:
   offline_steps: 100000

@@ -24,3 +24,5 @@ inference_itps/plots
 maze2d-large-sparse-v1.hdf5
 inference_itps/energy_coll_maps/
 inference_itps/tune_plots/
+inference_itps/tune_plots_*/
+run_exp.sh

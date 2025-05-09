@@ -7,6 +7,7 @@ import einops
 import argparse
 import numpy as np
 from scipy.spatial import distance
+import json
 
 
 from torch.cuda.amp import GradScaler
@@ -15,6 +16,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from deprecated import deprecated
+from torch.utils.data import Dataset, DataLoader
 
 from inference_itps.common.policies.utils import get_device_from_parameters
 from inference_itps.common.policies.policy_protocol import PolicyWithUpdate
@@ -33,6 +35,64 @@ from inference_itps.common.utils.utils import (
     init_logging,
     set_global_seed,
 )
+
+def GuideDataset(Dataset):
+    """Guide dataset."""
+
+    def __init__(self, json_file, guide_len = 80):
+        """
+        Arguments:
+            json_file (string): Path to the json_file file with guides.
+            guide_len (int): len of each path
+        """
+        
+        assert json_file is not None
+        with open(json_file, "r", buffering=1) as file:
+            file.seek(0)
+            trials = [json.loads(line) for line in file]
+            # set random seed and shuffle the trials
+            np.random.seed(0)
+            np.random.shuffle(trials)
+            
+        self.trials = trials
+        self.trial_idx = 0
+        self.guide_len = guide_len
+        self.guides = np.zeros((len(trials), self.guide_len, 2))
+ 
+        lens = []
+        remove_idx = []
+        for i in range(len(self.trials)):
+            print(self.trials[i])
+            guide = np.array(self.trials[i]["guide"])
+            print("guide len", guide.shape[0])
+            lens.append(guide.shape[0])
+            if guide.shape[0] < 20:
+                remove_idx.append(i)
+            n_missing = self.guide_len - guide.shape[0]
+            
+            if n_missing <= 0:
+                extended_traj = guide[:self.guide_len]
+            else:
+                last_point = guide[-1]
+                padding = np.tile(last_point, (n_missing, 1))
+                extended_traj = np.vstack((guide, padding))
+        
+            self.trials[i]["guide"] = extended_traj
+            
+        self.trials = [element for i, element in enumerate(self.trials) if i not in remove_idx]
+
+        # self.guides = np.delete(self.guides, np.array(remove_idx), axis=0)
+        print("min", min(lens))
+        print("mean", sum(lens) / len(lens))
+        print("max", max(lens))
+        print("removed", remove_idx)
+        print(len(self.trials))
+
+    def __len__(self):
+        return len(self.trials)
+
+    def __getitem__(self, idx):
+        return self.trials[idx]
 
 def plot_paths_torch(paths):
     xy = paths.detach().cpu().numpy()
@@ -130,7 +190,10 @@ class MazeEnv:
         return np.any(collisions, axis=1)
         
 class TunePolicy:
-    def __init__(self, policy):
+    """
+    Tune model with guide traj as condition
+    """
+    def __init__(self, policy, guide_loadpath):
         
         # with initialize(version_base=None, config_path="conf", job_name="test_app"):
         #     cfg = compose(config_name="config", overrides=["db=mysql", "db.user=me"])
@@ -140,7 +203,7 @@ class TunePolicy:
         self.policy = policy 
         
         self.batch_size = 32
-        self.dl_batch_size = 256
+        self.dl_batch_size = 32
         
         self.step = 0
         
@@ -180,7 +243,7 @@ class TunePolicy:
         self.device = device = torch.device("cuda") #get_device_from_parameters(policy)
         print("policy device", self.device)
         
-        dataloader = torch.utils.data.DataLoader(
+        dataloader = DataLoader(
             offline_dataset,
             num_workers= 4, # cfg.training.num_workers
             batch_size=self.dl_batch_size,
@@ -190,11 +253,22 @@ class TunePolicy:
             drop_last=False,
         )
         self.dl_iter = cycle(dataloader)
-        # 
+    
+        # Load saved guides
+        guide_dataset = GuideDataset(guide_loadpath)
+    
+        guide_dataloader = DataLoader(
+            guide_dataset,
+            num_workers= 4, # cfg.training.num_workers
+            batch_size=self.dl_batch_size,
+            shuffle=True,
+            # sampler=sampler,
+            pin_memory=self.device.type != "cpu",
+            drop_last=False,
+        )
+        self.guide_dl_iter = cycle(guide_dataloader)
         
-    def reset_policy(self, policy): 
-        self.policy = policy
-        
+
     def tune_energy(self, xy_pred, guide, obs_batch, max_steps=400, num_path_variations = 8): 
         action_i = torch.from_numpy(xy_pred).float().cuda()
         action = torch.cat((action_i, action_i[:, -1:, :]), 1)
@@ -269,156 +343,6 @@ class TunePolicy:
         return action_i.detach().cpu().numpy(), action_energy.detach().cpu().numpy(), self.step #, copy.deepcopy(obs_batch)
         
         
-    def tune_energy_resample_at_each_policy_update(self, xy_pred, guide, obs_batch, max_steps=400):
-        """
-        variation on energy tuning that randomizes start loction around og point to 
-        generate more trajectries to learn form 
-        """
-        # print("tuning obs_batch", obs_batch["observation.state"][-1][0])
-
-        # convert from numpy array to tensor
-        action_i = torch.from_numpy(xy_pred).float().cuda()
-        action = torch.cat((action_i, action_i[:, -1:, :]), 1)
-        guide = torch.from_numpy(guide).float().cuda()
-                
-        a_idx, a_nidx, a_e_choice = self.find_closest_paths(action, guide)
-        self.plot_high_low(action, a_idx, a_nidx, guide=guide, title="init")
-        self.freeze_partial_policy()
-        
-        num_path_variations = 8
-        
-        self.step = 0
-        for s in range(max_steps):
-
-            # new_actions = torch.zeros_like(action).to(action.device)
-            # # new_actions.repeat_interleave((1, num_path_variations))
-            # new_actions = einops.repeat(new_actions, 'b l d -> (n b) l d', n=num_path_variations)
-            # # new_actions = torch.repeat_interleave(new_actions, num_path_variations, dim=0)
-            # print(action.shape, new_actions.shape)
-            
-            dl_batch = next(self.dl_iter)
-            for key in dl_batch:
-                dl_batch[key] = dl_batch[key].to(self.device, non_blocking=True)
-            if dl_batch["action"].shape[0] != num_path_variations * 32: 
-                print("dataloader wrong batch size:", dl_batch["action"].shape[0])
-                continue
-            # else: 
-            # batch size can be 256 it is 32? now so x8
-            
-            new_actions, new_obs_batch = self.gen_alt_paths(obs_batch, num_path_variations)
-
-                
-            idx, nidx, e_choice = self.find_closest_paths(new_actions, guide)
-            # self.plot_high_low(new_actions, idx, nidx, guide=guide, title="dl")
-            # print("num of close paths:", len(idx))
-            # print("find_closest_paths eB", new_obs_batch["observation.state"].shape[0], new_obs_batch["observation.environment_state"].shape[0])
-
-            all_alt_obs_batch = self.gen_all_alt_obs_batch(obs_batch, num_path_variations)
-            action_low, action_high = self.gen_unique_energy_pairs(new_actions, idx, nidx)
-            e_batch = self.gen_batch_with_unique_energy_pairs(action_low, action_high, all_alt_obs_batch)
-            # print("gen_batch_with_energy_pairs eB", e_batch["action"].shape[0], e_batch["observation.state"].shape[0], e_batch["observation.environment_state"].shape[0])
-
-            for key in e_batch:
-                e_batch[key] = e_batch[key].to(self.device, non_blocking=True)
-                
-            if e_batch["action_low"].shape[0] != num_path_variations * 32: 
-                print("e_batch wrong batch size:", dl_batch["action"].shape[0])
-                continue
-            if e_batch["action_low"].shape[1] != dl_batch["action"].shape[1]: 
-                es =  e_batch["action"].shape[1]
-                dls =  dl_batch["action"].shape[1]
-                print("dataloader wrong batch size:", dl_batch["action"].shape[0])
-                raise Exception(f"action length does not match {es},{dls}")
-                continue
-                
-            train_info = self.update_policy_e(
-                e_batch,
-                dl_batch, 
-                self.step,
-            )
-            if (self.step+1) % self.log_freq == 0:
-                self.plot_high_low(new_actions, idx, nidx, guide=guide, title="dl")
-                print(self.step, train_info)
-            self.step += 1
-                
-            
-            ## Check policy converggence    
-            action_energy = self.policy.get_energy(action_i, copy.deepcopy(obs_batch))
-            energy_low = action_energy[a_e_choice.bool()] # TODO: replace with idx and nidx
-            energy_high = action_energy[~a_e_choice.bool()]
-            if s > 4 and (self.step+1) % 10 == 0:
-            
-                if min(energy_low) < min(energy_high): 
-                    print("policy converged, steps:", s, max(energy_low), min(energy_high))
-                    # print("policy converged, steps:", s, energy_low, energy_high)
-                    # print("obs_batch", obs_batch["observation.state"][-1][0])
-                    # return action_i.detach().cpu().numpy(), action_energy.detach().cpu().numpy(), self.step #, copy.deepcopy(obs_batch)
-        print("policy not converged", max(energy_low), min(energy_high))
-        return action_i.detach().cpu().numpy(), action_energy.detach().cpu().numpy(), self.step #, copy.deepcopy(obs_batch)
-        
-        
-        return
-    
-    @deprecated(version='0', reason="Old version of tuing without datatloader")
-    def tune_energy_with_guide(self, xy_pred, energy, guide, obs_batch):
-        # convert from numpy array to tensor
-        action_i = torch.from_numpy(xy_pred).float().cuda()
-        action = torch.cat((action_i, action_i[:, -1:, :]), 1)
-        energy = torch.from_numpy(energy).float().cuda()
-        guide = torch.from_numpy(guide).float().cuda()
-        
-        # find path closest to guide
-        idx, nidx, e_choice = self.find_closest_paths(action, guide)
-        
-        self.freeze_partial_policy()
-        
-        # iterate untill model converges or max itter reached
-        max_steps = 300
-        for s in range(max_steps): 
-            
-            # gen batch
-            dl_batch = next(self.dl_iter)
-            
-            e_batch = self.gen_batch_with_energy_pairs(action, obs_batch, idx, nidx)
-            
-            for key in e_batch:
-                e_batch[key] = e_batch[key].to(self.device, non_blocking=True)
-            for key in dl_batch:
-                dl_batch[key] = dl_batch[key].to(self.device, non_blocking=True)
-            
-            train_info = self.update_policy_e(
-                # self.policy,
-                e_batch,
-                dl_batch, 
-                # self.optimizer,
-                # self.grad_clip_norm,
-                s, 
-                # grad_scaler=self.grad_scaler,
-                # use_amp=self.use_amp,
-                # dl_batch = dl_batch
-            )
-            action_energy = self.policy.get_energy(action_i, copy.deepcopy(obs_batch))
-            energy_low = action_energy[e_choice.bool()] 
-            energy_high = action_energy[~e_choice.bool()]
-            if s > 4: 
-            
-                if min(energy_low) < min(energy_high): 
-                    print("policy converged, steps:", s, max(energy_low), min(energy_high))
-                    print("policy converged, steps:", s, energy_low, energy_high)
-                    break
-            print("policy not converged", max(energy_low), min(energy_high))
-            
-            
-        # logger.save_checkpont(
-        #     step,
-        #     policy,
-        #     optimizer,
-        #     lr_scheduler,
-        #     identifier=step_identifier,
-        # )
-
-        return
- 
     def update_policy_e(self, 
         # policy,
         batch,
@@ -763,11 +687,13 @@ class TunePolicy:
     
 
 class TestEnergyFineTuning():
-    def __init__(self, policy, policy_tag=None):
+    def __init__(self, policy, policy_tag=None, guide_loadpath=None):
+        
+            
         self.policy = policy
         self.policy_tag = policy_tag
         
-        self.tuner = TunePolicy(self.policy)
+        self.tuner = TunePolicy(self.policy, guide_loadpath)
         self.maze_env = MazeEnv()
         """
         [0        1  X  2     3     4]
@@ -791,6 +717,8 @@ class TestEnergyFineTuning():
         self.max_e = -np.inf
         self.min_e = np.inf
         
+    
+        
         
     def update_global_energy(self, energy): 
         self.max_e = max(max(energy), self.max_e)
@@ -802,16 +730,6 @@ class TestEnergyFineTuning():
             actions = actions.detach().cpu().numpy()
             energy = energy.detach().cpu().numpy()
         return actions, energy
-        # with torch.autocast(device_type="cuda"), seeded_context(0):
-        #     if return_energy: 
-        #         xy_pred, energy = self.tuner.infer_target(copy.deepcopy(obs_batch), return_energy=True)
-        #         xy_pred = xy_pred.detach().cpu().numpy()
-        #         energy = energy.detach().cpu().numpy()
-        #         return xy_pred, energy
-        #     else: 
-        #         xy_pred = self.tuner.infer_target(copy.deepcopy(obs_batch), return_energy=True)
-        #         xy_pred = xy_pred.detach().cpu().numpy()
-        #         return xy_pred
         
     
     def generate_energy_color_map(self, energies, global_range=False, include_zeros=True):
@@ -1141,36 +1059,42 @@ class TestEnergyFineTuning():
         plt.close('all')
         
     def test(self, s, g, max_steps=100):
-        start_loc_gui = self.key_points[s]
-        # self.update_agent_pos(start_loc)
-        guide_loc_gui = self.key_points[g]
+        pass
+        
+        
+        # do I tune with whole batch? 
+        
+        
+        # start_loc_gui = self.key_points[s]
+        # # self.update_agent_pos(start_loc)
+        # guide_loc_gui = self.key_points[g]
             
-        self.start_xy_pos = np.round(self.maze_env.gui2xy(start_loc_gui), 2)
-        self.guide_xy_pos = np.round(self.maze_env.gui2xy(guide_loc_gui), 2)
+        # self.start_xy_pos = np.round(self.maze_env.gui2xy(start_loc_gui), 2)
+        # self.guide_xy_pos = np.round(self.maze_env.gui2xy(guide_loc_gui), 2)
         
-        guide = einops.repeat(guide_loc_gui, "n -> t n", t=2)
-        guide = np.array([self.maze_env.gui2xy(point) for point in guide])
-        print("guide", guide)
+        # guide = einops.repeat(guide_loc_gui, "n -> t n", t=2)
+        # guide = np.array([self.maze_env.gui2xy(point) for point in guide])
+        # print("guide", guide)
         
-        self.save_path = f"inference_itps/tune_plots_iden_film_lp0.2/{self.policy_tag}_tune_plots_{max_steps}/{s}_{g}_({self.start_xy_pos[0]},{self.start_xy_pos[1]})_({self.guide_xy_pos[0]},{self.guide_xy_pos[1]})/"
-        os.makedirs(self.save_path, exist_ok = True)
+        # self.save_path = f"inference_itps/tune_plots_iden_film_lp0.2/{self.policy_tag}_tune_plots_{max_steps}/{s}_{g}_({self.start_xy_pos[0]},{self.start_xy_pos[1]})_({self.guide_xy_pos[0]},{self.guide_xy_pos[1]})/"
+        # os.makedirs(self.save_path, exist_ok = True)
 
-        obs_batch = self.tuner.gen_obs_batch(self.start_xy_pos)
-        self.start_xy, self.start_energy = self.infer_target(obs_batch)
-        self.update_global_energy(self.start_energy)
-        # self.plot_paths(xy_pred, energy, save_path=pos_string + "start", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+        # obs_batch = self.tuner.gen_obs_batch(self.start_xy_pos)
+        # self.start_xy, self.start_energy = self.infer_target(obs_batch)
+        # self.update_global_energy(self.start_energy)
+        # # self.plot_paths(xy_pred, energy, save_path=pos_string + "start", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
         
-        self.fit_xy, self.fit_energy, self.tune_steps = self.tuner.tune_energy(copy.deepcopy(self.start_xy), guide, copy.deepcopy(obs_batch), max_steps=max_steps)
-        self.update_global_energy(self.fit_energy)
-        # self.plot_paths(xy_pred, energy, save_path=pos_string + f"fit_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+        # self.fit_xy, self.fit_energy, self.tune_steps = self.tuner.tune_energy(copy.deepcopy(self.start_xy), guide, copy.deepcopy(obs_batch), max_steps=max_steps)
+        # self.update_global_energy(self.fit_energy)
+        # # self.plot_paths(xy_pred, energy, save_path=pos_string + f"fit_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
 
-        self.tune_xy, self.tune_energy, = self.infer_target(obs_batch)
-        self.update_global_energy(self.tune_energy)
-        # self.plot_paths(xy_pred, energy, save_path=pos_string + f"tuned_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+        # self.tune_xy, self.tune_energy, = self.infer_target(obs_batch)
+        # self.update_global_energy(self.tune_energy)
+        # # self.plot_paths(xy_pred, energy, save_path=pos_string + f"tuned_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
 
         
-        self.plot_avrg()
-        self.plot_all()
+        # self.plot_avrg()
+        # self.plot_all()
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1224,7 +1148,7 @@ if __name__ == "__main__":
     policy.cuda()
     policy.eval()
     
-    tester = TestEnergyFineTuning(policy, policy_tag)
+    tester = TestEnergyFineTuning(policy, policy_tag, guide_loadpath="inference_itps/a3_per_loc.json")
     s = int(args.start) # np.random.randint(len(key_points))
     g = int(args.guide) # np.random.randint(len(key_points))
     max_steps = int(args.max_steps)

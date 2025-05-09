@@ -49,6 +49,7 @@ from torch import Tensor, nn
 import argparse
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+from scipy.special import softmax
 
 from torch.cuda.amp import GradScaler
 from contextlib import nullcontext
@@ -57,19 +58,18 @@ from omegaconf import DictConfig
 import einops
 from pathlib import Path
 from huggingface_hub import snapshot_download
-from common.policies.diffusion.modeling_diffusion import DiffusionPolicy
-from common.policies.act.modeling_act import ACTPolicy
-from common.policies.rollout_wrapper import PolicyRolloutWrapper
-from common.utils.utils import seeded_context, init_hydra_config
-from common.policies.factory import make_policy
-from common.policies.utils import get_device_from_parameters
-from common.policies.policy_protocol import PolicyWithUpdate
-from common.logger import Logger, log_output_dir
-from common.datasets.factory import make_dataset
-from common.utils.path_utils import perturb_traj, generate_trajs
-from scipy.special import softmax
+from inference_itps.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from inference_itps.common.policies.act.modeling_act import ACTPolicy
+from inference_itps.common.policies.rollout_wrapper import PolicyRolloutWrapper
+from inference_itps.common.utils.utils import seeded_context, init_hydra_config
+from inference_itps.common.policies.factory import make_policy
+from inference_itps.common.policies.utils import get_device_from_parameters
+from inference_itps.common.policies.policy_protocol import PolicyWithUpdate
+from inference_itps.common.logger import Logger, log_output_dir
+from inference_itps.common.datasets.factory import make_dataset
+from inference_itps.common.utils.path_utils import perturb_traj, generate_trajs
 
-from scritps.tune import TunePolicy
+from inference_itps.scritps.tune import TunePolicy
 
 import time
 import json
@@ -1274,7 +1274,7 @@ class TestFinetuneEnergyMaze(FinetuneEnergyMaze):
         # for i in range(len(key_points)): 
         #     for j in range(len(key_points)):
         s = 4 # np.random.randint(len(key_points))
-        g = 14 # np.random.randint(len(key_points))
+        g = 3 # np.random.randint(len(key_points))
         if s == g: 
             pass
         else: 
@@ -1288,10 +1288,11 @@ class TestFinetuneEnergyMaze(FinetuneEnergyMaze):
             guide = einops.repeat(guide_loc, "n -> t n", t=2)
             guide = np.array([self.gui2xy(point) for point in guide])
             
-            pos_string = f"tune_plots/{self.policy_tag}_tune_plots_4000_s2/{s}_{g}_({start_xy_pos[0]},{start_xy_pos[1]})_({guide_xy_pos[0]},{guide_xy_pos[1]})/"
+            pos_string = f"tune_plots/{self.policy_tag}_tune_plots_16000_s2/{s}_{g}_({start_xy_pos[0]},{start_xy_pos[1]})_({guide_xy_pos[0]},{guide_xy_pos[1]})/"
             os.makedirs(pos_string, exist_ok = True)
 
             self.xy_pred, self.energy, self.obs_batch = self.infer_target()
+            print(self.obs_batch)
             self.update_global_energy()
             self.plot_paths(self.xy_pred, self.energy, save_path=pos_string + "start", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
             
@@ -1526,25 +1527,25 @@ if __name__ == "__main__":
         alignment_strategy = 'stochastic-sampling'
 
     if args.policy in ["diffusion", "dp"]:
-        checkpoint_path = 'weights/weights_dp'
+        checkpoint_path = 'inference_itps/weights/weights_dp'
     elif args.policy in ["dp_ebm"]:
-        checkpoint_path = 'weights/weights_maze2d_energy_dp_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_energy_dp_100k'
     elif args.policy in ["dp_ebm_n"]:
-        checkpoint_path = 'weights/weights_maze2d_dp_ebm_p_noise_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_ebm_p_noise_100k'
     elif args.policy in ["dp_ebm_p"]:
-        checkpoint_path = 'weights/weights_maze2d_dp_ebm_pert_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_ebm_pert_100k'
     elif args.policy in ["dp_ebm_hp"]:
-        checkpoint_path = 'weights/weights_maze2d_dp_ebm_half_pert_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_ebm_half_pert_100k'
     elif args.policy in ["dp_ebm_c"]:
-        checkpoint_path = 'weights/weights_maze2d_conf_coll_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_conf_coll_100k'
     elif args.policy in ["dp_ebm_c1"]:
-        checkpoint_path = 'weights/weights_maze2d_conf_coll_0.1_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_conf_coll_0.1_100k'
     elif args.policy in ["dp_ebm_c3"]:
-        checkpoint_path = 'weights/weights_maze2d_conf_coll_0.3_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_conf_coll_0.3_100k'
     elif args.policy in ["dp_no_cont"]:
-        checkpoint_path = 'weights/weights_maze2d_dp_no_contrast1_100k'
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_no_contrast1_100k'
     elif args.policy in ["act"]:
-        checkpoint_path = 'weights/weights_act'
+        checkpoint_path = 'inference_itps/weights/weights_act'
     else:
         raise NotImplementedError(f"Policy with name {args.policy} is not implemented.")
 

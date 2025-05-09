@@ -22,8 +22,8 @@ import datasets
 import torch
 import torch.utils
 
-from common.datasets.compute_stats import aggregate_stats
-from common.datasets.utils import (
+from inference_itps.common.datasets.compute_stats import aggregate_stats
+from inference_itps.common.datasets.utils import (
     calculate_episode_data_index,
     load_episode_data_index,
     load_hf_dataset,
@@ -33,7 +33,7 @@ from common.datasets.utils import (
     load_videos,
     reset_episode_index,
 )
-from common.datasets.video_utils import VideoFrame, load_from_videos
+from inference_itps.common.datasets.video_utils import VideoFrame, load_from_videos
 
 DATA_DIR = Path(os.environ["DATA_DIR"]) if "DATA_DIR" in os.environ else None
 CODEBASE_VERSION = "v1.5"

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys, os
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,8 @@ from threading import Lock
 import hydra
 import numpy as np
 import torch
+from torchsummary import summary
+
 from deepdiff import DeepDiff
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from termcolor import colored
@@ -39,6 +42,9 @@ from itps.common.datasets.utils import cycle
 from itps.common.envs.factory import make_env
 from itps.common.logger import Logger, log_output_dir
 from itps.common.policies.factory import make_policy
+
+from itps.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+
 from itps.common.policies.policy_protocol import PolicyWithUpdate
 from itps.common.policies.utils import get_device_from_parameters
 from itps.common.utils.utils import (
@@ -49,6 +55,45 @@ from itps.common.utils.utils import (
     set_global_seed,
 )
 from itps.scripts.eval import eval_policy
+
+def freeze_partial_policy(policy):
+    # Freeze layers
+    # for param in self.policy.diffusion.unet.diffusion_step_encoder.parameters():
+    #     param.requires_grad = False
+    # for param in self.policy.diffusion.unet.down_modules.parameters():
+    #     param.requires_grad = False
+    # for param in self.policy.diffusion.unet.mid_modules.parameters():
+    #     param.requires_grad = False
+    # action_energy_after = self.policy.get_energy(action_i, copy.deepcopy(obs_batch))
+        
+        
+    for param in policy.parameters():
+        param.requires_grad = False
+
+    for name, layer in policy.diffusion.unet.named_children():
+        # print(name)
+        for name, layer in layer.named_children(): 
+            # print("-", name)
+            for name, layer in layer.named_children(): 
+                # print("--", name)
+                if name in ['cond_encoder']:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+                else: 
+                    for name, layer in layer.named_children():
+                        # print("---", name)
+                        if name in ['cond_encoder']:
+                            for param in layer.parameters():
+                                param.requires_grad = True
+                        # else: 
+                        #     for name, layer in layer.named_children():
+                        #         # print("----", name)
+                        #         pass
+                                
+    for name, param in  policy.named_parameters():
+        if param.requires_grad:
+            print(f"Trainable layer: {name}")
+   
 
 
 def make_optimizer_and_scheduler(cfg, policy):
@@ -249,44 +294,6 @@ def log_eval_info(logger, info, step, cfg, dataset, is_online):
 
     logger.log_dict(info, step, mode="eval")
 
-def freeze_film_policy(policy, device):
-    for name, param in  policy.named_parameters():
-        if not param.requires_grad:
-            print(f"Frozen layer: {name}")
-    for name, layer in policy.diffusion.unet.named_children():
-        # print(name)
-        for name, layer in layer.named_children(): 
-            # print("-", name)
-            for name, layer in layer.named_children(): 
-                # print("--", name)
-                if name in ['cond_encoder']:
-                    for param in layer.parameters():
-                        param.requires_grad = False
-                else: 
-                    for name, layer in layer.named_children():
-                        # print("---", name)
-                        if name in ['cond_encoder']:
-                            for param in layer.parameters():
-                                param.requires_grad = False
-                        # else: 
-                        #     for name, layer in layer.named_children():
-                        #         # print("----", name)
-                        #         pass
-    for name, param in  policy.named_parameters():
-        if param.requires_grad:
-            print(f"Trainable layer: {name}")
-            
-    for name, param in  policy.named_parameters():
-        if not param.requires_grad:
-            print(f"Frozen layer: {name}")
-            if 'weight' in name: 
-                print(param.shape)
-                param.data = nn.parameter.Parameter(torch.eye(param.shape[0], param.shape[1], device=device))
-            elif 'bias' in name: 
-                param.data = nn.parameter.Parameter(torch.zeros_like(param))
-            # else: 
-            #     raise Exception("not weight or bias?")
-                
 
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
     print(cfg.dataset_repo_id)
@@ -302,45 +309,48 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
     # If we are resuming a run, we need to check that a checkpoint exists in the log directory, and we need
     # to check for any differences between the provided config and the checkpoint's config.
-    if cfg.resume:
-        if not Logger.get_last_checkpoint_dir(out_dir).exists():
-            raise RuntimeError(
-                "You have set resume=True, but there is no model checkpoint in "
-                f"{Logger.get_last_checkpoint_dir(out_dir)}"
-            )
-        checkpoint_cfg_path = str(Logger.get_last_pretrained_model_dir(out_dir) / "config.yaml")
-        logging.info(
-            colored(
-                "You have set resume=True, indicating that you wish to resume a run",
-                color="yellow",
-                attrs=["bold"],
-            )
-        )
-        # Get the configuration file from the last checkpoint.
-        checkpoint_cfg = init_hydra_config(checkpoint_cfg_path)
-        # Check for differences between the checkpoint configuration and provided configuration.
-        # Hack to resolve the delta_timestamps ahead of time in order to properly diff.
-        resolve_delta_timestamps(cfg)
-        diff = DeepDiff(OmegaConf.to_container(checkpoint_cfg), OmegaConf.to_container(cfg))
-        # Ignore the `resume` and parameters.
-        if "values_changed" in diff and "root['resume']" in diff["values_changed"]:
-            del diff["values_changed"]["root['resume']"]
-        # Log a warning about differences between the checkpoint configuration and the provided
-        # configuration.
-        if len(diff) > 0:
-            logging.warning(
-                "At least one difference was detected between the checkpoint configuration and "
-                f"the provided configuration: \n{pformat(diff)}\nNote that the checkpoint configuration "
-                "takes precedence.",
-            )
-        # Use the checkpoint config instead of the provided config (but keep `resume` parameter).
-        cfg = checkpoint_cfg
-        cfg.resume = True
-    elif Logger.get_last_checkpoint_dir(out_dir).exists():
-        raise RuntimeError(
-            f"The configured output directory {Logger.get_last_checkpoint_dir(out_dir)} already exists. If "
-            "you meant to resume training, please use `resume=true` in your command or yaml configuration."
-        )
+    # if cfg.resume:
+    #     if not Logger.get_last_checkpoint_dir(cfg.pre_trained_dir).exists():
+    #         raise RuntimeError(
+    #             "You have set resume=True, but there is no model checkpoint in "
+    #             f"{Logger.get_last_checkpoint_dir(cfg.pre_trained_dir)}"
+    #         )
+    #     checkpoint_cfg_path = str(Logger.get_last_pretrained_model_dir(cfg.pre_trained_dir) / "config.yaml")
+    #     logging.info(
+    #         colored(
+    #             "You have set resume=True, indicating that you wish to resume a run",
+    #             color="yellow",
+    #             attrs=["bold"],
+    #         )
+    #     )
+    #     # Get the configuration file from the last checkpoint.
+    #     checkpoint_cfg = init_hydra_config(checkpoint_cfg_path)
+    #     # Check for differences between the checkpoint configuration and provided configuration.
+    #     # Hack to resolve the delta_timestamps ahead of time in order to properly diff.
+    #     resolve_delta_timestamps(cfg)
+    #     diff = DeepDiff(OmegaConf.to_container(checkpoint_cfg), OmegaConf.to_container(cfg))
+    #     # Ignore the `resume` and parameters.
+    #     if "values_changed" in diff and "root['resume']" in diff["values_changed"]:
+    #         del diff["values_changed"]["root['resume']"]
+    #     # Log a warning about differences between the checkpoint configuration and the provided
+    #     # configuration.
+    #     if len(diff) > 0:
+    #         logging.warning(
+    #             "At least one difference was detected between the checkpoint configuration and "
+    #             f"the provided configuration: \n{pformat(diff)}\nNote that the checkpoint configuration "
+    #             "takes precedence.",
+    #         )
+    #     # Use the checkpoint config instead of the provided config (but keep `resume` parameter).
+    #     pre_trained_cfg = checkpoint_cfg
+    #     # TODO: Check neccesary overrides
+        
+    #     # cfg = checkpoint_cfg
+    #     # cfg.resume = True
+    # elif Logger.get_last_checkpoint_dir(out_dir).exists():
+    #     raise RuntimeError(
+    #         f"The configured output directory {Logger.get_last_checkpoint_dir(out_dir)} already exists. If "
+    #         "you meant to resume training, please use `resume=true` in your command or yaml configuration."
+    #     )
 
     # log metrics to terminal and wandb
     logger = Logger(cfg, out_dir, wandb_job_name=job_name)
@@ -370,11 +380,22 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         eval_env = make_env(cfg)
 
     logging.info("make_policy")
-    policy = make_policy(
-        hydra_cfg=cfg,
-        dataset_stats=offline_dataset.stats if not cfg.resume else None,
-        pretrained_policy_name_or_path=str(logger.last_pretrained_model_dir) if cfg.resume else None,
-    )
+    # policy = make_policy(
+    #     hydra_cfg=pre_trained_cfg,
+    #     dataset_stats=offline_dataset.stats if not cfg.resume else None,
+    #     pretrained_policy_name_or_path=str(logger.last_pretrained_model_dir) if cfg.resume else None,
+    # )
+    # print("pre_trained_dir.device", cfg.pre_trained_dir.device)
+    pretrained_policy_path = Path(os.path.join(cfg.pre_trained_dir, "pretrained_model"))
+    policy = DiffusionPolicy.from_pretrained(pretrained_policy_path)
+    policy.to(device)
+    # summary(policy)
+    # for name, layer in policy.named_children():
+    #     print("name", name)
+    #     print("layer", layer)
+        
+    # return
+        
     assert isinstance(policy, nn.Module)
     # Create optimizer and scheduler
     # Temporary hack to move optimizer out of policy
@@ -383,8 +404,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
     step = 0  # number of policy updates (forward + backward + optim)
 
-    if cfg.resume:
-        step = logger.load_last_training_state(optimizer, lr_scheduler)
+    # if cfg.resume:
+    #     step = logger.load_last_training_state(optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -457,10 +478,13 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         drop_last=False,
     )
     dl_iter = cycle(dataloader)
-
-    freeze_film_policy(policy, device)
+    
+    
 
     policy.train()
+    
+    freeze_partial_policy(policy)
+    
     offline_step = 0
     for _ in range(step, cfg.training.offline_steps):
         if offline_step == 0:
@@ -469,9 +493,13 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         start_time = time.perf_counter()
         batch = next(dl_iter)
         dataloading_s = time.perf_counter() - start_time
-
+        # print(policy)
+        # print("policy device", device)
         for key in batch:
             batch[key] = batch[key].to(device, non_blocking=True)
+            # print(key, "device", batch[key].device)
+        # print(batch.shape)
+        # print(batch)
 
         train_info = update_policy(
             policy,
@@ -649,6 +677,9 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
             for key in batch:
                 batch[key] = batch[key].to(cfg.device, non_blocking=True)
+                
+            print("batch shape", batch.shape())
+            # return
 
             train_info = update_policy(
                 policy,

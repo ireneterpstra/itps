@@ -198,6 +198,12 @@ def load_hf_dataset(repo_id: str, version: str, root: Path, split: str) -> datas
     else:
         safe_version = get_hf_dataset_safe_version(repo_id, version)
         hf_dataset = load_dataset(repo_id, revision=safe_version, split=split)
+        if 'pusht' in repo_id:
+            # def gen_environment_state(dataset):
+            #     dataset["observation.environment_state"] = [state for state in v["observation.state"]]
+            #     return dataset
+            hf_dataset = hf_dataset.map(lambda example: {"observation.environment_state": example["observation.state"]})
+            print(hf_dataset.column_names)
 
     hf_dataset.set_transform(hf_transform_to_torch)
     return hf_dataset

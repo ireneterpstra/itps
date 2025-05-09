@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import warnings
 
 import torch
 from omegaconf import ListConfig, OmegaConf
@@ -114,6 +115,10 @@ def make_dataset(cfg, split: str = "train") -> LeRobotDataset | MultiLeRobotData
             for stats_type, listconfig in stats_dict.items():
                 # example of stats_type: min, max, mean, std
                 stats = OmegaConf.to_container(listconfig, resolve=True)
-                dataset.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                # print(dataset.stats)
+                if key not in dataset.stats.keys():
+                    warnings.warn(f"{key} not in Dataset")
+                else: 
+                    dataset.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     return dataset

@@ -1,8 +1,11 @@
 # @package _global_
 
+# Defaults for training for the PushT dataset as per https://github.com/real-stanford/diffusion_policy.
+# Note: We do not track EMA model weights as we discovered it does not improve the results. See
+#       https://github.com/huggingface/lerobot/pull/134 for more details.
+
 seed: 100000
-dataset_repo_id: maze2d
-dataset_root: './maze2d-large-sparse-v1.hdf5'
+dataset_repo_id: lerobot/pusht
 
 wandb:
   enable: true
@@ -10,21 +13,34 @@ hydra:
   run:
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
-    dir: ./data/maze2d_dp_no_contrasive/outputs/${now:%Y.%m.%d}/${hydra.job.name}
+    dir: ./data/pusht_dp_ebm_no_img/outputs/${now:%Y.%m.%d}/${hydra.job.name}
   job:
-    name: ${now:%H.%M.%S}_${env.name}_${policy.name}_no_contrasive
+    name: ${now:%H.%M.%S}_${env.name}_${policy.name}_ebm_no_img
 
-device: "cuda:1"  # cpu
+
+override_dataset_stats:
+  # TODO(rcadene, alexander-soare): should we remove image stats as well? do we use a pretrained vision model?
+  # observation.image:
+  #   mean: [[[0.5]], [[0.5]], [[0.5]]]  # (c,1,1)
+  #   std: [[[0.5]], [[0.5]], [[0.5]]]  # (c,1,1)
+  # TODO(rcadene, alexander-soare): we override state and action stats to use the same as the pretrained model
+  # from the original codebase, but we should remove these and train our own pretrained model
+  observation.state:
+    min: [13.456424, 32.938293]
+    max: [496.14618, 510.9579]
+  action:
+    min: [12.0, 25.0]
+    max: [511.0, 511.0]
 
 training:
-  offline_steps: 100000
+  offline_steps: 200000
   online_steps: 0
   eval_freq: 0
   save_freq: 5000
   log_freq: 250
   save_checkpoint: true
 
-  batch_size: 256
+  batch_size: 64
   grad_clip_norm: 10
   lr: 1.0e-4
   lr_scheduler: cosine
@@ -35,7 +51,7 @@ training:
   online_steps_between_rollouts: 1
 
   delta_timestamps:
-    observation.environment_state: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, 1)]"
+    observation.image: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, 1)]"
     observation.state: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, 1)]"
     action: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, 1 - ${policy.n_obs_steps} + ${policy.horizon})]"
 
@@ -52,19 +68,19 @@ policy:
 
   # Input / output structure.
   n_obs_steps: 2
-  horizon: 64
+  horizon: 16
   n_action_steps: 8
 
   input_shapes:
     # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
-    observation.environment_state: [2]
+    observation.image: [3, 96, 96]
     observation.state: ["${env.state_dim}"]
   output_shapes:
     action: ["${env.action_dim}"]
 
   # Normalization / Unnormalization
   input_normalization_modes:
-    observation.environment_state: min_max
+    observation.image: mean_std
     observation.state: min_max
   output_normalization_modes:
     action: min_max
@@ -78,13 +94,13 @@ policy:
   use_group_norm: True
   spatial_softmax_num_keypoints: 32
   # Unet.
-  down_dims: [128, 256, 512]
+  down_dims: [512, 1024, 2048]
   kernel_size: 5
   n_groups: 8
   diffusion_step_embed_dim: 128
   use_film_scale_modulation: True
   # Noise scheduler.
-  noise_scheduler_type: DDIM
+  noise_scheduler_type: DDPM
   num_train_timesteps: 100
   beta_schedule: squaredcos_cap_v2
   beta_start: 0.0001
@@ -94,9 +110,11 @@ policy:
   clip_sample_range: 1.0
 
   # Inference
-  num_inference_steps: 10  # if not provided, defaults to `num_train_timesteps`
+  num_inference_steps: null  # if not provided, defaults to `num_train_timesteps`
 
   # Loss computation
   do_mask_loss_for_padding: false
 
-  supervise_energy_landscape: False
+  supervise_energy_landscape: True
+
+  include_images: False

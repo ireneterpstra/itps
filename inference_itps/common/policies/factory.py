@@ -18,8 +18,8 @@ import logging
 
 from omegaconf import DictConfig, OmegaConf
 
-from common.policies.policy_protocol import Policy
-from common.utils.utils import get_safe_torch_device
+from inference_itps.common.policies.policy_protocol import Policy
+from inference_itps.common.utils.utils import get_safe_torch_device
 
 
 def _policy_cfg_from_hydra_cfg(policy_cfg_class, hydra_cfg):

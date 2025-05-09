@@ -7,8 +7,8 @@ from copy import deepcopy
 import torch
 from torch import Tensor
 
-from common.policies.policy_protocol import Policy
-from common.policies.utils import get_device_from_parameters
+from itps.common.policies.policy_protocol import Policy
+from itps.common.policies.utils import get_device_from_parameters
 
 
 class PolicyRolloutWrapper:
@@ -103,7 +103,7 @@ class PolicyRolloutWrapper:
         """
         # Stack relevant observations into a sequence.
         observation_timestamps_ms = torch.tensor(
-            [action_timestamp_ms + i * self.period_ms for i in range(1 - self.policy.n_obs_steps, 1)]
+            [action_timestamp_ms + i * self.period_ms for i in range(1 - self.policy.config.n_obs_steps, 1)]
         )
         with self._thread_lock:
             observation_cache_timestamps_ms = torch.tensor(sorted(self._observation_cache.keys()))
