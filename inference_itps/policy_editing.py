@@ -1392,6 +1392,170 @@ class ConditionalMaze(UnconditionalMaze):
         self.savefile.write(json.dumps(entry) + "\n")
         print(f"Trial {self.trial_idx} saved to {self.savepath}.")
         self.trial_idx += 1
+        
+class TunedConditionalMazeXY(UnconditionalMaze):
+    # for interactive guidance dataset collection
+    def __init__(self, policy, savepath=None, alignment_strategy=None, policy_tag=None):
+        super().__init__(policy, policy_tag=policy_tag)
+        self.drawing = False
+        self.keep_drawing = False
+        # self.vis_dp_dynamics = vis_dp_dynamics
+        self.savefile = None
+        self.savepath = savepath
+        self.draw_traj = [] # gui coordinates
+        self.xy_pred = None # numpy array
+        self.collisions = None # boolean array
+        self.scores = None # numpy array
+        self.alignment_strategy = alignment_strategy
+        
+    def generate_energy_color_map(self, energies):
+        num_es = len(energies)
+        cmap = plt.get_cmap('rainbow')
+        energies_norm = (energies-np.min(energies))/(np.max(energies)-np.min(energies))
+        # values = np.linspace(0, 1, num_es)
+        # print("min - max energies", np.min(energies), np.max(energies))
+        colors = cmap(energies_norm)
+        return colors
+        
+    def update_screen_energy(self, xy_pred=None, energies=None, collisions=None, keep_drawing=False):
+        self.draw_maze_background()
+        print((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), self.gui2xy((int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])))) 
+        if xy_pred is not None:
+            energy_colors = self.generate_energy_color_map(energies.squeeze())
+            cmap = ListedColormap(["darkorange", "lightseagreen", "lawngreen", "pink"]) #"lawngreen", 
+            # colors = cmap(c)
+            if collisions is None:
+                collisions = self.check_collision(xy_pred)
+            self.report_collision_percentage(collisions)
+            for idx, pred in enumerate(xy_pred):
+                color = (energy_colors[idx, :3] * 255).astype(int)
+                for step_idx in range(len(pred) - 1):
+                    # color = (time_colors[step_idx, :3] * 255).astype(int)
+                    
+                    # visualize constraint violations (collisions) by tinting trajectories white
+                    whiteness_factor = 0.1 if collisions[idx] else 0.0 
+                    # color = self.blend_with_white(color, whiteness_factor)
+                    if idx < 32: 
+                        circle_size = 5
+                    else: 
+                        circle_size = 2
+                    
+                    start_pos = self.xy2gui(pred[step_idx])
+                    end_pos = self.xy2gui(pred[step_idx + 1])
+                    pygame.draw.circle(self.screen, color, start_pos, circle_size)
+
+        pygame.draw.circle(self.screen, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 20)
+        if keep_drawing: # visualize the human drawing input
+            for i in range(len(self.draw_traj) - 1):
+                pygame.draw.line(self.screen, self.RED, self.draw_traj[i], self.draw_traj[i + 1], 10)
+
+        pygame.display.flip()
+        
+    def infer_target(self, guide=None):
+        agent_hist_xy = self.agent_history_xy[-1] 
+        agent_hist_xy = np.array(agent_hist_xy).reshape(1, 2)
+        
+        
+        if self.policy_tag[:2] == 'dp':
+            agent_hist_xy_r = agent_hist_xy.repeat(2, axis=0)
+
+        obs_batch = {
+            "observation.state": einops.repeat(
+                torch.from_numpy(agent_hist_xy_r).float().cuda(), "t d -> b t d", b=self.batch_size
+            )
+        }
+        
+        if guide is not None:
+            # guide = torch.from_numpy(guide).float().cuda()
+            end_pos = guide[-1]
+            end_pos = np.array(end_pos).reshape(1, 2)
+            
+            # env_state = np.concatenate((agent_hist_xy, end_pos), axis=0)
+            env_state = np.concatenate((end_pos, end_pos), axis=0)
+            print("env_state.shape", env_state.shape)
+
+            obs_batch["observation.environment_state"] = einops.repeat(
+                torch.from_numpy(env_state).float().cuda(), "t d -> b t d", b=self.batch_size
+            )
+        else: 
+            obs_batch["observation.environment_state"] = einops.repeat(
+                torch.from_numpy(agent_hist_xy_r).float().cuda(), "t d -> b t d", b=self.batch_size
+            )
+            
+        with torch.autocast(device_type="cuda"), seeded_context(0):
+            actions, energy = self.policy.run_inference(copy.deepcopy(obs_batch), return_energy=True) # directly call the policy in order to visualize the intermediate steps
+            actions = actions.detach().cpu().numpy()
+            energy = energy.detach().cpu().numpy()
+        return actions, energy, obs_batch
+        
+
+    def run(self):
+        if self.savepath is not None:
+            self.savefile = open(self.savepath, "a+", buffering=1)
+            self.trial_idx = 0
+
+        while self.running:
+            self.update_mouse_pos()
+
+            # Handle events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    break
+                if any(pygame.mouse.get_pressed()):  # Check if mouse button is pressed
+                    if not self.drawing:
+                        self.drawing = True
+                        self.draw_traj = []
+                    self.draw_traj.append(self.mouse_pos)
+                else: # mouse released
+                    if self.drawing: 
+                        self.drawing = False # finish drawing action
+                        self.keep_drawing = True # keep visualizing the drawing
+                if event.type == pygame.KEYDOWN: 
+                    # press s to save the trial
+                    if event.key == pygame.K_s and self.savefile is not None:
+                        self.save_trials()             
+
+            if self.keep_drawing: # visualize the human drawing input
+                # Check if mouse returns to the agent's location
+                if np.linalg.norm(self.mouse_pos - self.agent_gui_pos) < 20:  # Threshold distance to reactivate the agent
+                    self.keep_drawing = False # delete the drawing
+                    self.draw_traj = []
+
+            if not self.drawing: # inference mode
+                if not self.keep_drawing:
+                    self.update_agent_pos(self.mouse_pos.copy())
+                if len(self.draw_traj) > 0:
+                    guide = np.array([self.gui2xy(point) for point in self.draw_traj])
+                else:
+                    guide = None
+                self.xy_pred, self.energy, obs_batch = self.infer_target(guide)
+                self.scores = None
+                
+                self.collisions = self.check_collision(self.xy_pred)
+
+            # self.update_screen(self.xy_pred, self.collisions, self.scores, (self.keep_drawing or self.drawing))
+            self.update_screen_energy(self.xy_pred, self.energy, self.collisions, (self.keep_drawing or self.drawing))
+
+            self.clock.tick(30)
+
+        pygame.quit()
+
+    def save_trials(self):
+        b, t, _ = self.xy_pred.shape
+        xy_pred = self.xy_pred.reshape(b*t, 2)
+        pred_gui_traj = [self.xy2gui(xy) for xy in xy_pred]
+        pred_gui_traj = np.array(pred_gui_traj).reshape(b, t, 2)
+        entry = {
+            "trial_idx": self.trial_idx,
+            "agent_pos": self.agent_gui_pos.tolist(),
+            "guide": np.array(self.draw_traj).tolist(),
+            "pred_traj": pred_gui_traj.astype(int).tolist(),
+            "collisions": self.collisions.tolist()
+        }
+        self.savefile.write(json.dumps(entry) + "\n")
+        print(f"Trial {self.trial_idx} saved to {self.savepath}.")
+        self.trial_idx += 1
 
 class MazeExp(ConditionalMaze):
     # for replaying the trials and benchmarking the alignment strategies
@@ -1544,8 +1708,18 @@ if __name__ == "__main__":
         checkpoint_path = 'inference_itps/weights/weights_maze2d_conf_coll_0.3_100k'
     elif args.policy in ["dp_no_cont"]:
         checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_no_contrast1_100k'
-    elif args.policy in ["act"]:
-        checkpoint_path = 'inference_itps/weights/weights_act'
+    elif args.policy in ["dp_ebm_p_frz_film"]:
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_ebm_frz_film_100k'
+    elif args.policy in ["dp_ebm_p_iden_film"]:
+        checkpoint_path = 'inference_itps/weights/weights_maze2d_dp_ebm_iden_film_100k'
+    elif args.policy in ["dp_ebm_p_frz_film_tuned"]:
+        checkpoint_path = 'inference_itps/tune_weights/dp_ebm_p_frz_film_2000'
+    elif args.policy in ["dp_ebm_p_iden_film_tuned"]:
+        checkpoint_path = 'inference_itps/tune_weights/low_p_2_env/dp_ebm_p_iden_film_3000'
+    elif args.policy in ["dp_ebm_p_frz_film_low_p_2_env"]:
+        checkpoint_path = 'inference_itps/tune_weights/low_p_2_env/dp_ebm_p_frz_film_2000'
+    elif args.policy in ["dp_ebm_p_iden_tune_wrapped"]:
+        checkpoint_path = 'inference_itps/tune_weights/wrapped_env_state/dp_ebm_p_iden_film_2000'
     else:
         raise NotImplementedError(f"Policy with name {args.policy} is not implemented.")
 
@@ -1606,7 +1780,7 @@ if __name__ == "__main__":
         interactiveMaze = FinetuneEnergyMaze(policy, args.savepath, policy_tag=policy_tag)
     elif args.test_tune:
         print("tt")
-        interactiveMaze = TestFinetuneEnergyMaze(policy, pretrained_policy_path, args.savepath, policy_tag=policy_tag_a)
+        interactiveMaze = TunedConditionalMazeXY(policy, args.savepath, alignment_strategy, policy_tag=policy_tag_a)
 
     else:
         interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag)

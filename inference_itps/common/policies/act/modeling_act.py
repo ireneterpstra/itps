@@ -34,8 +34,8 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from common.policies.act.configuration_act import ACTConfig
-from common.policies.normalize import Normalize, Unnormalize
+from inference_itps.common.policies.act.configuration_act import ACTConfig
+from inference_itps.common.policies.normalize import Normalize, Unnormalize
 
 
 class ACTPolicy(nn.Module, PyTorchModelHubMixin):

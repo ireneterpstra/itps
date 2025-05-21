@@ -10,9 +10,9 @@ hydra:
   run:
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
-    dir: ./data/maze2d_dp_ebm_identity_film/outputs/${now:%Y.%m.%d}/${hydra.job.name}
+    dir: ./data/maze2d_dp_ebm_indetity_film_zero_env/outputs/${now:%Y.%m.%d}/${hydra.job.name}
   job:
-    name: ${now:%H.%M.%S}_${env.name}_${policy.name}_indetity_film
+    name: ${now:%H.%M.%S}_${env.name}_${policy.name}_indetity_film_zero_env
 
 device: "cuda:1"  # cpu
 

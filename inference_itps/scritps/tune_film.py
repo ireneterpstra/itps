@@ -14,6 +14,8 @@ from torch.cuda.amp import GradScaler
 from contextlib import nullcontext
 from pathlib import Path
 import matplotlib.pyplot as plt
+from torch import Tensor, nn
+
 from matplotlib import cm
 from deprecated import deprecated
 from torch.utils.data import Dataset, DataLoader
@@ -26,6 +28,8 @@ from inference_itps.common.datasets.utils import cycle
 from inference_itps.common.utils.utils import seeded_context, init_hydra_config
 from hydra import compose, initialize
 
+from inference_itps.common.policies.policy_protocol import Policy
+
 from inference_itps.common.datasets.sampler import EpisodeAwareSampler
 from inference_itps.common.datasets.factory import make_dataset, resolve_delta_timestamps
 from inference_itps.common.utils.utils import (
@@ -36,16 +40,122 @@ from inference_itps.common.utils.utils import (
     set_global_seed,
 )
 
-def GuideDataset(Dataset):
+from omegaconf import DictConfig, OmegaConf
+from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from huggingface_hub import PyTorchModelHubMixin
+
+
+def freeze_partial_policy(policy):
+    # Freeze layers
+    # for param in self.policy.diffusion.unet.diffusion_step_encoder.parameters():
+    #     param.requires_grad = False
+    # for param in self.policy.diffusion.unet.down_modules.parameters():
+    #     param.requires_grad = False
+    # for param in self.policy.diffusion.unet.mid_modules.parameters():
+    #     param.requires_grad = False
+    # action_energy_after = self.policy.get_energy(action_i, copy.deepcopy(obs_batch))
+    
+    
+    for param in policy.parameters():
+        param.requires_grad = False
+
+    for name, layer in policy.diffusion.unet.named_children():
+        # print(name)
+        for name, layer in layer.named_children(): 
+            # print("-", name)
+            for name, layer in layer.named_children(): 
+                # print("--", name)
+                if name in ['cond_encoder']:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+                else: 
+                    for name, layer in layer.named_children():
+                        # print("---", name)
+                        if name in ['cond_encoder']:
+                            for param in layer.parameters():
+                                param.requires_grad = True
+                        # else: 
+                        #     for name, layer in layer.named_children():
+                        #         # print("----", name)
+                        #         pass
+                                
+    for name, param in  policy.named_parameters():
+        if param.requires_grad:
+            print(f"Trainable layer: {name}")
+                
+class FilmWrapper(nn.Module, PyTorchModelHubMixin):
+    def __init__(self, diffusion_model, input_shape, output_shape):
+        super().__init__()
+        
+        self.device = get_device_from_parameters(diffusion_model)
+
+        # Set up model
+        self.diffusion_model = diffusion_model        
+        # Freeze All Except Film Layers
+        freeze_partial_policy(self.diffusion_model)
+        
+        # for name, param in  self.policy.named_parameters():
+        #     if param.requires_grad:
+        #         print(f"Trainable layer: {name}")
+      
+        # Encoder
+        self.encoder = nn.Sequential(
+                                nn.Linear(
+                                    in_features=input_shape, out_features=128
+                                ),
+                                nn.ReLU(),
+                                nn.Linear(
+                                    in_features=128, out_features=output_shape
+                                ),
+                                nn.ReLU(),
+        )
+        
+    def run_encoder(self, batch): 
+        # Encoder
+        env_input = einops.rearrange(batch["observation.environment_state"], 'b c t -> b (c t)')
+        env_encoding = self.encoder(env_input)
+        
+        env_encoding = einops.rearrange(env_encoding, 'b (c t) -> b c t', c=2, t=2)
+        batch["observation.environment_state"] = env_encoding
+        return batch
+
+    def forward(self, dl_batch, e_batch):        
+
+        e_batch = self.run_encoder(e_batch)
+        dl_batch = self.run_encoder(dl_batch)
+        x = self.diffusion_model.forward_condition_end(dl_batch, e_batch)
+      
+        return x
+    
+    def get_energy(self, trajectories: Tensor, observation_batch: dict[str, Tensor]):
+        observation_batch = self.run_encoder(observation_batch)
+        return self.diffusion_model.get_energy(trajectories, observation_batch)
+    
+    def run_inference(self, observation_batch: dict[str, Tensor], guide: Tensor | None = None, visualizer=None, return_energy=False, high_energy_guide=False) -> Tensor:
+        observation_batch = self.run_encoder(observation_batch)
+        return self.diffusion_model.run_inference(observation_batch, guide, visualizer, return_energy, high_energy_guide)
+    
+    
+    
+
+
+def save_model(save_dir: Path, policy: Policy):
+    """Save the weights of the Policy model using PyTorchModelHubMixin.
+    """
+    os.makedirs(f"{save_dir}/pretrained_model", exist_ok = True)
+    policy.save_pretrained(save_dir)
+
+class GuideDataset(Dataset):
     """Guide dataset."""
 
-    def __init__(self, json_file, guide_len = 80):
+    def __init__(self, json_file, guide_len = 80, device="cuda"):
         """
         Arguments:
             json_file (string): Path to the json_file file with guides.
             guide_len (int): len of each path
         """
         
+        # self.device =
         assert json_file is not None
         with open(json_file, "r", buffering=1) as file:
             file.seek(0)
@@ -62,9 +172,7 @@ def GuideDataset(Dataset):
         lens = []
         remove_idx = []
         for i in range(len(self.trials)):
-            print(self.trials[i])
             guide = np.array(self.trials[i]["guide"])
-            print("guide len", guide.shape[0])
             lens.append(guide.shape[0])
             if guide.shape[0] < 20:
                 remove_idx.append(i)
@@ -78,7 +186,11 @@ def GuideDataset(Dataset):
                 extended_traj = np.vstack((guide, padding))
         
             self.trials[i]["guide"] = extended_traj
-            
+            self.trials[i]["pred_traj"] = np.array(self.trials[i]["pred_traj"])
+            self.trials[i]["collisions"] = np.array(self.trials[i]["collisions"])
+            self.trials[i]["agent_pos"] = np.array(self.trials[i]["agent_pos"])
+        print(self.trials[0].keys())
+        print(self.trials[0]["pred_traj"].shape)
         self.trials = [element for i, element in enumerate(self.trials) if i not in remove_idx]
 
         # self.guides = np.delete(self.guides, np.array(remove_idx), axis=0)
@@ -89,10 +201,58 @@ def GuideDataset(Dataset):
         print(len(self.trials))
 
     def __len__(self):
+        # print(len(self.trials))
         return len(self.trials)
 
     def __getitem__(self, idx):
         return self.trials[idx]
+
+class StartEndDataset(Dataset):
+    """StartEnd dataset."""
+
+    def __init__(self, json_file, device="cuda"):
+        """
+        Arguments:
+            json_file (string): Path to the json_file file with guides.
+            guide_len (int): len of each path
+        """
+        
+        # self.device =
+        assert json_file is not None
+        with open(json_file, "r", buffering=1) as file:
+            file.seek(0)
+            trials = [json.loads(line) for line in file]
+            # set random seed and shuffle the trials
+            np.random.seed(0)
+            np.random.shuffle(trials)
+            
+        self.trials = trials
+        self.trial_idx = 0
+        
+        for i in range(len(trials)):
+            for key in self.trials[i]:
+                self.trials[i][key] = np.array(self.trials[i][key], dtype=np.float32)
+                # print(self.trials[i]["num_close"])
+            self.trials[i]["observation.state"] = self.trials[i]["start_pos"].repeat(2, axis=0)
+            # what if env state is start + end?
+            env_state = np.concatenate((self.trials[i]["start_pos"], self.trials[i]["end_pos"]), axis=0)
+            
+            self.trials[i]["observation.environment_state"] = env_state
+            self.trials[i]["action"] = self.trials[i]["pred_traj"]
+        print(self.trials[0]["start_pos"].shape)
+        print(self.trials[0]["end_pos"].shape)
+        print(self.trials[0]["observation.state"].shape)
+        print(self.trials[0]["observation.environment_state"].shape)
+
+        print(len(self.trials))
+
+    def __len__(self):
+        # print(len(self.trials))
+        return len(self.trials)
+
+    def __getitem__(self, idx):
+        return self.trials[idx]
+
 
 def plot_paths_torch(paths):
     xy = paths.detach().cpu().numpy()
@@ -193,17 +353,30 @@ class TunePolicy:
     """
     Tune model with guide traj as condition
     """
-    def __init__(self, policy, guide_loadpath):
+    def __init__(self, policy, guide_loadpath, policy_tag, save_path=None):
         
         # with initialize(version_base=None, config_path="conf", job_name="test_app"):
         #     cfg = compose(config_name="config", overrides=["db=mysql", "db.user=me"])
         #     print(OmegaConf.to_yaml(cfg))
         cfg = init_hydra_config("inference_itps/configs/policy/tune_config.yaml")
+        self.policy_tag = policy_tag
+        if save_path is None: 
+            self.save_path = f"inference_itps/tune_weights/{policy_tag}"
+        else: 
+            self.save_path = f"{save_path}/{policy_tag}"
+            
+        # TODO: change input shape? 
+        self.device = device = torch.device("cuda") #get_device_from_parameters(policy)
+        print("policy device", self.device)
+        self.policy = FilmWrapper(policy, input_shape=4, output_shape=4)
+        self.policy.to(get_safe_torch_device(self.device))
         
-        self.policy = policy 
+        for name, param in self.policy.named_parameters():
+            if param.requires_grad:
+                print(f"Trainable layer: {name}")
         
-        self.batch_size = 32
-        self.dl_batch_size = 32
+        self.batch_size = 64
+        self.dl_batch_size = 64
         
         self.step = 0
         
@@ -221,7 +394,7 @@ class TunePolicy:
         self.lock = None
         
         self.optimizer = torch.optim.Adam(
-            self.policy.diffusion.parameters(),
+            self.policy.diffusion_model.diffusion.parameters(),
             lr,
             adam_betas,
             adam_eps,
@@ -240,8 +413,7 @@ class TunePolicy:
             shuffle=True,
         )
         
-        self.device = device = torch.device("cuda") #get_device_from_parameters(policy)
-        print("policy device", self.device)
+        
         
         dataloader = DataLoader(
             offline_dataset,
@@ -255,7 +427,8 @@ class TunePolicy:
         self.dl_iter = cycle(dataloader)
     
         # Load saved guides
-        guide_dataset = GuideDataset(guide_loadpath)
+        # guide_dataset = GuideDataset(guide_loadpath)
+        guide_dataset = StartEndDataset(guide_loadpath)
     
         guide_dataloader = DataLoader(
             guide_dataset,
@@ -269,83 +442,67 @@ class TunePolicy:
         self.guide_dl_iter = cycle(guide_dataloader)
         
 
-    def tune_energy(self, xy_pred, guide, obs_batch, max_steps=400, num_path_variations = 8): 
-        action_i = torch.from_numpy(xy_pred).float().cuda()
-        action = torch.cat((action_i, action_i[:, -1:, :]), 1)
-        guide = torch.from_numpy(guide).float().cuda()
+    def tune_start_end(self, max_steps=400): 
                 
-        a_idx, a_nidx, a_e_choice = self.find_closest_paths(action, guide)
-        self.plot_high_low(action, a_idx, a_nidx, guide=guide, title="init")
-        
-        # Freeze All Except Film Layers
-        self.freeze_partial_policy()
-        
-        for name, param in  self.policy.named_parameters():
-            if param.requires_grad:
-                print(f"Trainable layer: {name}")
         
         self.step = 0
         
-        
-        
-        actions_low, actions_high = self.generate_full_dataset(action, guide, copy.deepcopy(obs_batch), max_steps, num_path_variations)
+        # for each batch 
+            # identify low and high paths
+                # try variation where I only pick one path
+                # rip code staright from inference
+                # create dataset with slected path + non selcted
+            # update with dl + guide dl
         for s in range(max_steps):
-            ## Sample from original dataset
+            e_batch = next(self.guide_dl_iter)
+            for key in e_batch:
+                # print(key)
+                e_batch[key] = e_batch[key].to(self.device, non_blocking=True)
+            e_batch_i = copy.deepcopy(e_batch)
+            # idx, nidx = self.find_closest_paths(e_batch["pred_traj"], e_batch["guide"])
+            # for b in range(self.batch_size):
+            #     num_close_b = e_batch["num_close"][b] + 1
+            #     idx = e_batch["sort_idx"][b][:num_close_b]
+            #     nidx = e_batch["sort_idx"][b][num_close_b:]
+            #     self.plot_high_low(e_batch["pred_traj"][b], idx, nidx, start_pos=e_batch["start_pos"][b], end_pos=e_batch["end_pos"][b], title=f"high_low_close_w_start_end_{b}")
+
             dl_batch = next(self.dl_iter)
             for key in dl_batch:
+                # print(key)
                 dl_batch[key] = dl_batch[key].to(self.device, non_blocking=True)
-            if dl_batch["action"].shape[0] != num_path_variations * self.batch_size: 
-                print("dataloader wrong batch size:", dl_batch["action"].shape[0])
-                continue
-            
-            ## Get genertaed high low energy paths
-            action_low = actions_low[s]
-            action_high = actions_high[s]
-            e_batch = self.gen_batch_with_unique_energy_pairs(action_low, action_high, copy.deepcopy(obs_batch))
-            all_alt_obs_batch = self.gen_all_alt_obs_batch(obs_batch, num_path_variations)
-            
-            e_batch["observation.state"] = all_alt_obs_batch["observation.state"]
-            e_batch["observation.environment_state"] = all_alt_obs_batch["observation.environment_state"]
-            
-            for key in e_batch:
-                e_batch[key] = e_batch[key].to(self.device, non_blocking=True)
-                
-            ## Assert genertaed samples match dataset batch size
-            if e_batch["action_low"].shape[0] != num_path_variations * self.batch_size: 
-                print("e_batch wrong batch size:", dl_batch["action"].shape[0])
-                continue
-            if e_batch["action_low"].shape[1] != dl_batch["action"].shape[1]: 
-                es =  e_batch["action"].shape[1]
-                dls =  dl_batch["action"].shape[1]
-                print("dataloader wrong batch size:", dl_batch["action"].shape[0])
-                raise Exception(f"action length does not match {es},{dls}")
-                continue
             
             train_info = self.update_policy_e(
                 e_batch,
-                dl_batch, 
+                dl_batch,
                 self.step,
             )
-            if (self.step+1) % self.log_freq == 0:
+            if (self.step) % self.log_freq == 0:
                 print(self.step, train_info)
             self.step += 1
-                
             
-            ## Check policy converggence    
-            action_energy = self.policy.get_energy(action_i, copy.deepcopy(obs_batch))
-            energy_low = action_energy[a_e_choice.bool()] # TODO: replace with idx and nidx
-            energy_high = action_energy[~a_e_choice.bool()]
-            if s > 4 and (self.step+1) % 10 == 0:
+            # Check policy converggence    
+            picked = e_batch_i["high"]
+            action_energy = self.policy.get_energy(e_batch_i["action"], e_batch_i)
+            energy_low = action_energy[picked.bool()] # TODO: replace with idx and nidx
+            energy_high = action_energy[~picked.bool()]
             
-                if min(energy_low) < min(energy_high): 
-                    print("policy converged, steps:", s, max(energy_low), min(energy_high))
-        print("policy not converged", max(energy_low), min(energy_high))
-        return action_i.detach().cpu().numpy(), action_energy.detach().cpu().numpy(), self.step #, copy.deepcopy(obs_batch)
+            # if s > 4 and (self.step) % 10 == 0:
+            #     if len(energy_low) != 0: 
+            #         if min(energy_low) < min(energy_high): 
+            #             print("policy converged, steps:", s, max(energy_low), min(energy_high))
+            #     else: 
+            #         print("no low e")
+                    
+            if s > 4 and (self.step) % 1000 == 0:
+                save_model(save_dir = f"{self.save_path}_{self.step}", policy=self.policy)
+                    
+        save_model(save_dir = f"{self.save_path}_{self.step}", policy=self.policy)
         
+        return
         
     def update_policy_e(self, 
         # policy,
-        batch,
+        e_batch,
         dl_batch, 
         # optimizer,
         # grad_clip_norm,
@@ -362,7 +519,7 @@ class TunePolicy:
         
         self.policy.train()
         with torch.autocast(device_type=self.device.type) if self.use_amp else nullcontext():
-            output_dict = self.policy.forward_e_g(dl_batch, batch)
+            output_dict = self.policy.forward(dl_batch, e_batch)
             # TODO(rcadene): policy.unnormalize_outputs(out_dict)
             loss = output_dict["loss"]
             loss_denoise, loss_energy, loss_opt = output_dict["sub_loss"]
@@ -412,159 +569,60 @@ class TunePolicy:
         info.update({k: v for k, v in output_dict.items() if k not in info and k != "sub_loss"})
         
         return info
-
-    def generate_full_dataset(self, action, guide, obs_batch, max_steps, num_path_variations):
-        actions_low = torch.zeros_like(action).to(action.device)
-        actions_high = torch.zeros_like(action).to(action.device)
-        actions_low = einops.repeat(actions_low, 'b t d -> ms (b nv) t d', ms=max_steps, nv=num_path_variations)
-        actions_high = einops.repeat(actions_high, 'b t d -> ms (b nv) t d', ms=max_steps, nv=num_path_variations)
-        print(actions_low.shape)
-        print(actions_high.shape)
-        for s in range(max_steps):
-            new_actions, new_obs_batch = self.gen_alt_paths(obs_batch, num_path_variations)
-            idx, nidx, e_choice = self.find_closest_paths(new_actions, guide)
-            
-            action_low, action_high = self.gen_unique_energy_pairs(new_actions, idx, nidx)
-            if (s+1) % 50 == 0:
-                print(f'num low found {len(idx)}, num high found {len(nidx)}')
-                self.plot_high_low(new_actions, idx, nidx, guide=guide, title=f"dl_{s}")
-            actions_low[s] = action_low
-            actions_high[s] = action_high
-        return actions_low, actions_high
             
 
     def find_closest_paths(self, action, guide):
-        assert action.shape[2] == 2 and guide.shape[1] == 2
-        # printsxds(guide)
-        cdist = torch.cdist(action[:, -5:, :], guide, p=2)
-
-        cdist_min, cdist_min_indices = torch.min(cdist, dim=2)
-        cdist_min1, cdist_min_indices1 = torch.min(cdist_min, dim=1)
-
-        cdx_sort = torch.argsort(cdist_min1, dim=0)
-        # print("min cdist_min1", min(cdist_min1), cdist_min1[cdx_sort], cdist_min1[cdx_sort]-min(cdist_min1))
-        cdist_mask_idx = torch.where(cdist_min1[cdx_sort]-min(cdist_min1) < 0.5, 1, 0)
+        print(action.shape,guide.shape)
+        assert action.shape[3] == 2 and guide.shape[2] == 2
+        indices = torch.linspace(0, guide.shape[1]-1, action.shape[2], dtype=int)
+        print(indices)
         
-        idx = cdx_sort[cdist_mask_idx.bool()]
-        nidx = cdx_sort[~cdist_mask_idx.bool()]
+        guide = torch.unsqueeze(guide[:, indices, :], dim=1) # (batch, 1, pred_horizon, action_dim)
+        assert guide.shape == (action.shape[0], 1, action.shape[2], action.shape[3])
+        print(guide.type)
+        print((action - guide).shape)
+        action = action.to(torch.float64)
+        guide = guide.to(torch.float64)
+        dist = torch.linalg.norm(action - guide, dim=3, ord=2) # (B, B, pred_horizon)
+        assert dist.shape == (action.shape[0], action.shape[1], action.shape[2])
+        dist = dist.mean(dim=2) # (B, B,)
         
-        if (self.step+1) % self.log_freq == 0:
-            print("num close found", len(idx), len(nidx))
+        print(dist)
+
+        
+        dist_min, distx_sort = torch.sort(dist, dim=1)
+        
+        #for now just pick one
+        just_one = True
+        
+        if just_one:
+            idx = distx_sort[:, :1]
+            nidx = distx_sort[:, 1:]
+            return idx, nidx
+        else: 
+        # print(dist_min)
+        # dist_min = torch.unsqueeze(dist_min, dim=1)
+        
+        
+            dm = dist - dist_min[:, 0:1]
+            print(dm)
+            # print("min cdist_min1", min(cdist_min1), cdist_min1[cdx_sort], cdist_min1[cdx_sort]-min(cdist_min1))
+            cdist_mask_idx = torch.where(dm < 0.5, 1, 0)
             
-        # make energies that match that guide 
-        e_choice = torch.zeros(action.size(0)).to(action.device)
-        e_choice[idx] = 1
-        
-        return idx, nidx, e_choice
-    
-    def gen_unique_energy_pairs(self, paths, idx, nidx):
-        action = paths.clone()
-        
-        def gen_var(index, d_len): 
-            i_to_pert = index[torch.randint(len(index), (d_len,))]
-            ac = action[i_to_pert]
-            varr = torch.rand(d_len, 2).float().cuda()
-            varr = einops.repeat(varr, "d l -> d t l", t=action.shape[1])
-            return ac + (varr * 0.05 - 0.025)
-        
-        low_shortfall = action.shape[0] - len(idx)
-        low_var = gen_var(idx, low_shortfall)
-        action_low = torch.cat((action[idx], low_var), 0)
-        
-        high_shortfall = action.shape[0] - len(nidx)
-        high_var = gen_var(nidx, high_shortfall)
-        action_high = torch.cat((action[nidx], high_var), 0)
-        
-        shuffle_low = torch.randperm(action_low.shape[0]).int().cuda()
-        shuffle_high = torch.randperm(action_high.shape[0]).int().cuda()
-        
-        action_low = action_low[shuffle_low]
-        action_high = action_high[shuffle_high]
-        
-        if action.shape[0] != action_low.shape[0] and action.shape[0] != action_high.shape[0]: 
-            raise Exception(f'Actions not right length {action.shape[0]},{action_low.shape[0]},{action_high.shape[0]}')
-        # idx_f = torch.range(0, action.shape[0]).int().cuda()
-        # self.plot_high_low(action_low, idx_f, torch.range(0, 1), guide=None, title="low_high_test_low")
-        # self.plot_high_low(action_high, torch.range(0, 1), idx_f, guide=None, title="low_high_test_high")
-        
-        return action_low, action_high
-    
-    def gen_batch_with_unique_energy_pairs(self, action_low, action_high, obs_batch):
-                
-        e_batch = copy.deepcopy(obs_batch)
+            idx = distx_sort[cdist_mask_idx.bool()]
+            nidx = distx_sort[~cdist_mask_idx.bool()]
             
-        # e_batch["action"] = perm_paths[torch.randperm(perm_paths.shape[0])]
-        e_batch["action_low"] = action_low
-        e_batch["action_high"] = action_high
+            if (self.step+1) % self.log_freq == 0:
+                print("num close found", len(idx), len(nidx))
+            
+            # make energies that match that guide 
+            # e_choice = torch.zeros(action.size(0)).to(action.device)
+            # e_choice[idx] = 1
         
-        return e_batch
+            return idx, nidx #, e_choice
     
-    def gen_batch_with_energy_pairs(self, action, obs_batch, idx, nidx):
-        #Shuffle batch
-        # print("gen_batch_with_energy_pairs eB", obs_batch["action"].shape[0], obs_batch["observation.state"].shape[0], obs_batch["observation.environment_state"].shape[0])
-
-        action_low = action.clone()
-        action_high = action.clone()
         
-        # for i in range(action.shape[0]):
-            # pick random low index
-        
-        low_idx = idx[torch.randint(len(idx), (action.shape[0],))]
-        high_idx = nidx[torch.randint(len(nidx), (action.shape[0],))]
-        action_low = action[low_idx]
-        action_high = action[high_idx]
-        
-        print("low_idx", low_idx)
-        print("high_idx", high_idx)
-        print("action_low shape", action_low.shape)
-        print("action_high shape", action_high.shape)
-        e_batch = copy.deepcopy(obs_batch)
-        
-        perm_a = action.clone()
     
-        e_batch["action"] = perm_a[torch.randperm(perm_a.shape[0])]
-        e_batch["action_low"] = action_low
-        e_batch["action_high"] = action_high
-        
-        return e_batch
-    
-    def freeze_partial_policy(self):
-        # Freeze layers
-        # for param in self.policy.diffusion.unet.diffusion_step_encoder.parameters():
-        #     param.requires_grad = False
-        # for param in self.policy.diffusion.unet.down_modules.parameters():
-        #     param.requires_grad = False
-        # for param in self.policy.diffusion.unet.mid_modules.parameters():
-        #     param.requires_grad = False
-        # action_energy_after = self.policy.get_energy(action_i, copy.deepcopy(obs_batch))
-        
-        
-        for param in self.policy.parameters():
-            param.requires_grad = False
-    
-        for name, layer in self.policy.diffusion.unet.named_children():
-            # print(name)
-            for name, layer in layer.named_children(): 
-                # print("-", name)
-                for name, layer in layer.named_children(): 
-                    # print("--", name)
-                    if name in ['cond_encoder']:
-                        for param in layer.parameters():
-                            param.requires_grad = True
-                    else: 
-                        for name, layer in layer.named_children():
-                            # print("---", name)
-                            if name in ['cond_encoder']:
-                                for param in layer.parameters():
-                                    param.requires_grad = True
-                            # else: 
-                            #     for name, layer in layer.named_children():
-                            #         # print("----", name)
-                            #         pass
-                                    
-        for name, param in  self.policy.named_parameters():
-            if param.requires_grad:
-                print(f"Trainable layer: {name}")
    
    
     def infer_target(self, obs_batch, guide=None, return_energy=False):
@@ -574,42 +632,12 @@ class TunePolicy:
         else: 
             actions = self.policy.run_inference(copy.deepcopy(obs_batch), guide=guide, return_energy=False)
             return actions
-    
-    def gen_alt_paths(self, prev_obs_batch, n):
-        """
-        perturb start loaction and generate more paths that would be near the selected path
-        """
-        new_obs_batch = self.gen_alt_obs_batch(prev_obs_batch, n)
-        # 
-        # for n in range(num_paths): 
-        action = self.infer_target(new_obs_batch)
-        # print("action", action.shape)
-        action = torch.cat((action, action[:, -1:, :]), 1)
-        return action, new_obs_batch
-    
-    
-    def gen_alt_obs_batch(self, prev_obs_batch, n):
-        start_loc = prev_obs_batch["observation.state"][-1][0]
-        # print("start_loc", start_loc)
-        n_start_loc = start_loc + (torch.rand(n, 2).float().cuda() * 0.2 - 0.1)
-        # print("start_loc", start_loc, n_start_loc)
-        n_start_loc = einops.repeat(n_start_loc, "n d -> n t d", t=2)
-
-
-        # can i make it more efficient here? 
-        obs_batch = {
-            "observation.state": einops.repeat(
-                n_start_loc, "n t d -> (b n) t d", b=self.batch_size
-            )
-        }
-        obs_batch["observation.environment_state"] = einops.repeat(
-            n_start_loc, "n t d -> (b n) t d", b=self.batch_size
-        )
-        return obs_batch
-    
-    def gen_obs_batch(self, start_loc):
+        
+    def gen_obs_batch(self, start_loc, guide_loc=None):
         start_loc = torch.tensor(start_loc.reshape(1, 2)).float().cuda()
         start_loc = einops.repeat(start_loc, "n d -> n t d", t=2)
+        
+        
 
         # can i make it more efficient here? 
         obs_batch = {
@@ -617,27 +645,19 @@ class TunePolicy:
                 start_loc, "n t d -> (b n) t d", b=self.batch_size
             )
         }
-        obs_batch["observation.environment_state"] = einops.repeat(
-            start_loc, "n t d -> (b n) t d", b=self.batch_size
-        )
+        if guide_loc is not None: 
+            guide_loc = torch.tensor(guide_loc.reshape(1, 2)).float().cuda()
+            guide_loc = einops.repeat(guide_loc, "n d -> n t d", t=2)
+            obs_batch["observation.environment_state"] = einops.repeat(
+                guide_loc, "n t d -> (b n) t d", b=self.batch_size
+            )
+        else: 
+            obs_batch["observation.environment_state"] = einops.repeat(
+                start_loc, "n t d -> (b n) t d", b=self.batch_size
+            )
         return obs_batch
     
-    def gen_all_alt_obs_batch(self, prev_obs_batch, n):
-        start_loc = prev_obs_batch["observation.state"][-1][0]
-        start_loc = torch.tensor(start_loc.reshape(1, 2)).float().cuda()
-        n_start_loc = start_loc + (torch.rand(n * self.batch_size, 2).float().cuda() * 0.1 - 0.05)
-        n_start_loc = einops.repeat(n_start_loc, "a d -> a t d", t=2)
-
-        # print("obs device", start_loc.device)
-        # can i make it more efficient here? 
-        obs_batch = {
-            "observation.state": n_start_loc
-        }
-        obs_batch["observation.environment_state"] = n_start_loc
-        
-        return obs_batch
-    
-    def plot_high_low(self, paths, idx, nidx, guide=None, title=""):
+    def plot_high_low(self, paths, idx, nidx, start_pos=None, end_pos=None, title=""):
         xy = paths.detach().cpu().numpy()
         idx_low = idx.detach().cpu().numpy()
         idx_high = nidx.detach().cpu().numpy()
@@ -669,31 +689,85 @@ class TunePolicy:
             else: 
                 raise Exception("idx low and high should be complete set")
             
+        if start_pos is not None: 
+            # print("has guide")
+            guide_xy = start_pos.detach().cpu().numpy()
+            gX = guide_xy[:, 0]
+            gY = guide_xy[:, 1]
+            ax.plot(gX, gY, color="fuchsia", markersize=30, marker="P")      
+            
+        if end_pos is not None: 
+            # print("has guide")
+            guide_xy = end_pos.detach().cpu().numpy()
+            gX = guide_xy[:, 0]
+            gY = guide_xy[:, 1]
+            ax.plot(gX, gY, color="lime", markersize=30, marker="X") 
+        
+        plt.tight_layout()
+        
+        plt.savefig(f"inference_itps/test_high_low_plots/{title}_test.png", dpi=150)
+        
+        plt.clf()
+        plt.close('all')
+    
+    def plot_high_low_guide(self, paths, idx, nidx, guide=None, title=""):
+        xy = paths.detach().cpu().numpy()
+        idx_low = idx.detach().cpu().numpy()
+        idx_high = nidx.detach().cpu().numpy()
+        X = xy[:, :, 0]
+        Y = xy[:, :, 1]
+        
+        # print("path shape", paths.shape)
+        # Plot flat 
+        # fig, ax = plt.subplots(1, 2, figsize=(15, 9))
+        fig = plt.figure(figsize=(8, 11))
+        ax = fig.add_subplot()
+        # ax.set_ylim(12, 0)
+        
+        # ax.plot(X[idx_low], Y[idx_low], color="Blue")
+        # ax.plot(X[idx_high], Y[idx_high], color="Red")
+        # self.imshow3d(ax[0], maze, cmap="binary")
+        # self.imshow3d(ax[1], maze, cmap="binary")
+        # cmap = plt.get_cmap('rainbow')
+        # energies_norm = range(int(xy.shape[0]))
+
+        # colors = cmap(energies_norm)
+        for i in range(int(xy.shape[0])):
+            if i in idx_low:
+                print(X[i], Y[i])
+                ax.plot(X[i], Y[i], color="blue")
+                ax.scatter(X[i], Y[i], color="blue", s=5)
+            elif i in idx_high:
+                print(X[i], Y[i])
+                ax.plot(X[i], Y[i], color="red")
+                ax.scatter(X[i], Y[i], color="red", s=5)
+            else: 
+                raise Exception("idx low and high should be complete set")
+            
         if guide is not None: 
             # print("has guide")
             guide_xy = guide.detach().cpu().numpy()
             gX = guide_xy[:, 0]
-            gY = guide_xy[:, 1]  
+            gY = guide_xy[:, 1]
             ax.plot(gX, gY, color="lime")
             ax.scatter(gX, gY, color="lime", s=40)
         
         
         plt.tight_layout()
         
-        plt.savefig(f"inference_itps/tune_plots/{title}_test.png", dpi=150)
+        plt.savefig(f"inference_itps/{title}_test.png", dpi=150)
         
         plt.clf()
         plt.close('all')
     
 
 class TestEnergyFineTuning():
-    def __init__(self, policy, policy_tag=None, guide_loadpath=None):
+    def __init__(self, policy, policy_tag=None, guide_loadpath=None, save_path=None):
         
             
         self.policy = policy
         self.policy_tag = policy_tag
-        
-        self.tuner = TunePolicy(self.policy, guide_loadpath)
+        self.tuner = TunePolicy(self.policy, guide_loadpath, policy_tag=policy_tag, save_path=save_path)
         self.maze_env = MazeEnv()
         """
         [0        1  X  2     3     4]
@@ -716,9 +790,6 @@ class TestEnergyFineTuning():
             ])
         self.max_e = -np.inf
         self.min_e = np.inf
-        
-    
-        
         
     def update_global_energy(self, energy): 
         self.max_e = max(max(energy), self.max_e)
@@ -746,8 +817,7 @@ class TestEnergyFineTuning():
         colors = cmap(energies_norm)
         return colors
     
-    
-    
+
     def plot_paths(self, xy, energies, save_path="", start_loc=None, guide_loc=None, dpi=150, ):
         X = xy[:, :, 0]
         Y = xy[:, :, 1]
@@ -1058,47 +1128,47 @@ class TestEnergyFineTuning():
         plt.clf()
         plt.close('all')
         
-    def test(self, s, g, max_steps=100):
-        pass
-        
+    def test(self, s, g, max_steps=400):        
         
         # do I tune with whole batch? 
         
-        
-        # start_loc_gui = self.key_points[s]
-        # # self.update_agent_pos(start_loc)
-        # guide_loc_gui = self.key_points[g]
+        start_loc_gui = self.key_points[s]
+        # self.update_agent_pos(start_loc)
+        guide_loc_gui = self.key_points[g]
             
-        # self.start_xy_pos = np.round(self.maze_env.gui2xy(start_loc_gui), 2)
-        # self.guide_xy_pos = np.round(self.maze_env.gui2xy(guide_loc_gui), 2)
+        self.start_xy_pos = np.round(self.maze_env.gui2xy(start_loc_gui), 2)
+        self.guide_xy_pos = np.round(self.maze_env.gui2xy(guide_loc_gui), 2)
         
-        # guide = einops.repeat(guide_loc_gui, "n -> t n", t=2)
-        # guide = np.array([self.maze_env.gui2xy(point) for point in guide])
-        # print("guide", guide)
+        guide = einops.repeat(guide_loc_gui, "n -> t n", t=2)
+        guide = np.array([self.maze_env.gui2xy(point) for point in guide])
+        print("guide", guide)
         
-        # self.save_path = f"inference_itps/tune_plots_iden_film_lp0.2/{self.policy_tag}_tune_plots_{max_steps}/{s}_{g}_({self.start_xy_pos[0]},{self.start_xy_pos[1]})_({self.guide_xy_pos[0]},{self.guide_xy_pos[1]})/"
-        # os.makedirs(self.save_path, exist_ok = True)
+        self.save_path = f"inference_itps/tune_plots_guide_film/{self.policy_tag}_tune_plots_{max_steps}/{s}_{g}_({self.start_xy_pos[0]},{self.start_xy_pos[1]})_({self.guide_xy_pos[0]},{self.guide_xy_pos[1]})/"
+        os.makedirs(self.save_path, exist_ok = True)
 
-        # obs_batch = self.tuner.gen_obs_batch(self.start_xy_pos)
-        # self.start_xy, self.start_energy = self.infer_target(obs_batch)
-        # self.update_global_energy(self.start_energy)
-        # # self.plot_paths(xy_pred, energy, save_path=pos_string + "start", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
-        
-        # self.fit_xy, self.fit_energy, self.tune_steps = self.tuner.tune_energy(copy.deepcopy(self.start_xy), guide, copy.deepcopy(obs_batch), max_steps=max_steps)
+        start_obs_batch = self.tuner.gen_obs_batch(self.start_xy_pos)
+        self.start_xy, self.start_energy = self.infer_target(start_obs_batch)
+        self.fit_xy, self.fit_energy = self.start_xy, self.start_energy
+        self.update_global_energy(self.start_energy)
         # self.update_global_energy(self.fit_energy)
-        # # self.plot_paths(xy_pred, energy, save_path=pos_string + f"fit_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
 
-        # self.tune_xy, self.tune_energy, = self.infer_target(obs_batch)
-        # self.update_global_energy(self.tune_energy)
-        # # self.plot_paths(xy_pred, energy, save_path=pos_string + f"tuned_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+        # Tune        
+        self.tuner.tune_start_end(max_steps=max_steps)
 
+        guide_obs_batch = self.tuner.gen_obs_batch(self.start_xy_pos, self.guide_xy_pos)
+        self.tune_xy, self.tune_energy, = self.infer_target(guide_obs_batch)
+        self.update_global_energy(self.tune_energy)
+        # self.plot_paths(xy_pred, energy, save_path=pos_string + f"tuned_{steps}", start_loc=start_xy_pos, guide_loc=guide_xy_pos)
+
+        # 
         
-        # self.plot_avrg()
-        # self.plot_all()
+        self.plot_avrg()
+        self.plot_all()
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--policy', required=True, type=str, help="Policy name")
+    parser.add_argument('-sp', '--save_path', type=str, help="Model save path")
     parser.add_argument('-s', '--start', default=3, type=int, help="Start pos")
     parser.add_argument('-g', '--guide', default=4, type=int, help="Guide Pos")
     parser.add_argument('-m', '--max-steps', default=400, type=int, help="Max Steps")
@@ -1140,6 +1210,11 @@ if __name__ == "__main__":
     if args.policy is not None:
         pretrained_policy_path = Path(os.path.join(checkpoint_path, "pretrained_model"))
         
+    if args.save_path is not None:
+        save_path=f"inference_itps/tune_weights/{args.save_path}"
+    else: 
+        save_path="inference_itps/tune_weights/"
+        
     policy = DiffusionPolicy.from_pretrained(pretrained_policy_path, alignment_strategy=alignment_strategy)
     policy.config.noise_scheduler_type = "DDIM"
     policy.diffusion.num_inference_steps = 10
@@ -1148,16 +1223,16 @@ if __name__ == "__main__":
     policy.cuda()
     policy.eval()
     
-    tester = TestEnergyFineTuning(policy, policy_tag, guide_loadpath="inference_itps/a3_per_loc.json")
+    guide_loadpath = "inference_itps/dp_ebm_p_iden_film_debug_film_dataset_i_traj_10000.json"
+    # guide_loadpath = "inference_itps/a3_per_loc.json"
+    
+    tester = TestEnergyFineTuning(policy, policy_tag=policy_tag, guide_loadpath=guide_loadpath, save_path=save_path)
+    
     s = int(args.start) # np.random.randint(len(key_points))
     g = int(args.guide) # np.random.randint(len(key_points))
     max_steps = int(args.max_steps)
     print("start guide max_steps", s, g, max_steps)
     tester.test(s, g, max_steps)
-    # tester.plot_maze()
-    
-        
-    
     
     
     # if s == g: 

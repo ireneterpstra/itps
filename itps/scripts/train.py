@@ -472,6 +472,10 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
         for key in batch:
             batch[key] = batch[key].to(device, non_blocking=True)
+            
+        # if not cfg.policy.include_images:
+        batch["observation.environment_state"] = torch.zeros_like(batch["observation.environment_state"]).to(device, non_blocking=True)
+        
 
         train_info = update_policy(
             policy,

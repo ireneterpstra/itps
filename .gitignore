@@ -12,6 +12,8 @@ itps/weights/weights_*
 inference_itps/weights
 inference_itps/weights_*/
 inference_itps/weights_*
+inference_itps/tune_weights*
+inference_itps/test*
 itps/weights_*.zip
 .DS_Store
 .vscode
@@ -26,3 +28,4 @@ inference_itps/energy_coll_maps/
 inference_itps/tune_plots/
 inference_itps/tune_plots_*/
 run_exp.sh
+inference_itps/*.json
