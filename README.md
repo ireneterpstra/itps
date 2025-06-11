@@ -21,11 +21,43 @@ Download the pre-trained weights for [Diffusion Policy with Energy Model](https:
 
 ## Train the DP EBM Model
 
-#### From the repo folder: 
+From the repo folder: 
 ```
 python itps/scripts/train.py policy=maze2d_dp_ebm env=maze2d
 ```
 This will save your weights to `data/maze2d_dp/outputs/(date)/`
+
+
+## Train the DP EBM Model with the Start-End Encoder and Tune with path preferences
+
+### Train the DP EBM Model with the Start-End Encoder 
+
+```
+python itps/scripts/train.py policy=maze2d_dp_ebm_env_encoder env=maze2d
+```
+This will save your weights to `data/maze2d_dp/outputs/(date)/` you should move the weights to `itps/weights`
+
+### Generate the Dataset
+
+```
+python itps/scripts/gen_tune_dataset.py -n 10000 -p dp_ebm_iden_film_env_encoder -s dp_ebm_iden_film_env_encoder_dataset_10k.json
+```
+This will save your JSON dataset to `itps/inference_dataset`
+
+
+### Tune the Model 
+
+```
+python itps/scripts/tune_film.py -p dp_ebm_frz_film_env_encoder -sp tuned_ebm_frz_film_env_encoder_p0.1 -m 10000
+```
+This will save your weights to `itps/tune_weights`
+
+### Visualize tuned policy
+
+```
+python itps/scripts/policy_editing.py -p dp_ebm_frz_film_env_encoder_tuned_0.1 -tt
+```
+
 
 ## Visualize pre-trained policies. 
 #### From the `inference_itps` folder: 
